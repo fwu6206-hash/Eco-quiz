@@ -594,6 +594,37 @@ async function sList(prefix='', shared=false){
     return snap.docs.map(d=>d.id);
   }catch(e){ console.error('Firestore list failed', prefix, e); return []; }
 }
+/* Like sList, but returns {key, value} pairs from a SINGLE query instead of one
+   round-trip per key. Firestore already hands back full document data as part of
+   the listing query — sList+per-key sGet was throwing that data away and re-fetching
+   it one document at a time, which is why the leaderboard/teacher dashboard felt slow
+   once there were dozens of submissions. This is the fast path those views should use. */
+async function sListWithValues(prefix='', shared=false){
+  if(!shared){
+    try{
+      const out=[];
+      for(let i=0;i<localStorage.length;i++){
+        const k = localStorage.key(i);
+        if(k && k.startsWith(LOCAL_PREFIX)){
+          const orig = k.slice(LOCAL_PREFIX.length);
+          if(!prefix || orig.startsWith(prefix)) out.push({key:orig, value:localStorage.getItem(k)});
+        }
+      }
+      return out;
+    }catch(e){ return []; }
+  }
+  if(!firebaseReady) return [];
+  try{
+    let query = db.collection('kv');
+    if(prefix){
+      const end = prefix.slice(0,-1) + String.fromCharCode(prefix.charCodeAt(prefix.length-1)+1);
+      query = query.where(firebase.firestore.FieldPath.documentId(), '>=', prefix)
+                   .where(firebase.firestore.FieldPath.documentId(), '<', end);
+    }
+    const snap = await query.get();
+    return snap.docs.map(d=>({ key:d.id, value: d.data() ? d.data().value : null }));
+  }catch(e){ console.error('Firestore list-with-values failed', prefix, e); return []; }
+}
 async function getJSON(key, shared=false, fallback=null){
   const v = await sGet(key, shared);
   if(v===null) return fallback;
@@ -1171,24 +1202,22 @@ function viewCodeReady(){
 /* ================= LEADERBOARD ================= */
 async function fetchAllSubmissions(force=false){
   if(STATE.cache.submissions && !force) return STATE.cache.submissions;
-  const keys = await sList('submission:', true);
-  const sorted = keys.slice().sort().reverse();
-  const limited = sorted.slice(0, 400);
+  const entries = await sListWithValues('submission:', true);
+  entries.sort((a,b)=> a.key < b.key ? 1 : (a.key > b.key ? -1 : 0)); // newest first (keys are timestamp-prefixed)
+  const limited = entries.slice(0, 1000);
   const results = [];
-  for(const k of limited){
-    const v = await sGet(k, true);
-    if(v){ try{ results.push(JSON.parse(v)); }catch(e){} }
+  for(const {value} of limited){
+    if(value){ try{ results.push(JSON.parse(value)); }catch(e){} }
   }
   STATE.cache.submissions = results;
   return results;
 }
 async function fetchAllExamCodes(force=false){
   if(STATE.cache.examcodes && !force) return STATE.cache.examcodes;
-  const keys = await sList('examcode:', true);
+  const entries = await sListWithValues('examcode:', true);
   const results = [];
-  for(const k of keys){
-    const v = await sGet(k, true);
-    if(v){ try{ results.push(JSON.parse(v)); }catch(e){} }
+  for(const {value} of entries){
+    if(value){ try{ results.push(JSON.parse(value)); }catch(e){} }
   }
   STATE.cache.examcodes = results;
   return results;
@@ -1199,8 +1228,13 @@ function viewLeaderboard(){
   return `
   <button class="backlink" data-action="go" data-view="${STATE.profile.name?'challenge-menu':'home'}">← 返回</button>
   <div class="card">
-    <span class="section-eyebrow">${icon('trophy',16)} 累積排行榜</span>
-    <h2 class="h-title">歷次成績排行</h2>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap">
+      <div>
+        <span class="section-eyebrow">${icon('trophy',16)} 累積排行榜</span>
+        <h2 class="h-title">歷次成績排行</h2>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="leaderboard-refresh">↻ 重新整理</button>
+    </div>
     <div class="spacer-16"></div>
     <div id="lbFilters"></div>
     <div id="lbContent"><div class="loading"><span class="spin"></span>載入成績中…</div></div>
@@ -1285,8 +1319,13 @@ function viewTeacherDashboard(){
   return `
   <button class="backlink" data-action="go" data-view="home">← 返回首頁</button>
   <div class="card">
-    <span class="section-eyebrow">${icon('key',16)} 教師後台</span>
-    <h2 class="h-title">學生學習狀況總覽</h2>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap">
+      <div>
+        <span class="section-eyebrow">${icon('key',16)} 教師後台</span>
+        <h2 class="h-title">學生學習狀況總覽</h2>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="teacher-refresh">↻ 重新整理資料</button>
+    </div>
     <div class="tabs" style="margin-top:18px">
       <button class="tab ${STATE.teacherTab==='overview'?'on':''}" data-action="teacher-tab" data-tab="overview">總覽</button>
       <button class="tab ${STATE.teacherTab==='records'?'on':''}" data-action="teacher-tab" data-tab="records">學生紀錄</button>
@@ -1298,9 +1337,9 @@ function viewTeacherDashboard(){
   </div>`;
 }
 
-async function renderTeacherAsync(){
-  const subs = await fetchAllSubmissions(true);
-  const codes = await fetchAllExamCodes(true);
+async function renderTeacherAsync(forceRefresh=false){
+  const subs = await fetchAllSubmissions(forceRefresh);
+  const codes = await fetchAllExamCodes(forceRefresh);
   if(STATE.view!=='teacher-dashboard') return;
   const el = document.getElementById('teacherContent');
   if(!el) return;
@@ -1480,6 +1519,16 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   }
   else if(action==='teacher-tab'){
     STATE.teacherTab = el.dataset.tab;
+    render();
+  }
+  else if(action==='teacher-refresh'){
+    STATE.cache.submissions = null;
+    STATE.cache.examcodes = null;
+    render();
+  }
+  else if(action==='leaderboard-refresh'){
+    STATE.cache.submissions = null;
+    STATE.cache.examcodes = null;
     render();
   }
   else if(action==='delete-examcode'){
@@ -1734,4 +1783,3 @@ async function copyRecordsCsv(){
 </script>
 </body>
 </html>
-
