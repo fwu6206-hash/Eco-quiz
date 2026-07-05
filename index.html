@@ -689,6 +689,9 @@ const STATE = {
   teacherTab:'overview',
   lbFilter:'all',
   lbSearch:'',
+  lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
+  lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
+  lbCustomLimit:'',
   cache:{ submissions:null, examcodes:null },
   loading:false,
   importBusy:false,
@@ -1198,6 +1201,39 @@ async function fetchAllExamCodes(force=false){
   return results;
 }
 
+function getPoolSize(s){
+  // Prefer the value captured at submission time; fall back to recomputing from the
+  // stored level list for older records saved before poolSize was tracked.
+  if(s.poolSize!=null) return s.poolSize;
+  return buildPool(new Set(s.levels||[])).length;
+}
+const LB_SORT_OPTIONS = [
+  { key:'combined', label:'綜合排名（預設）' },
+  { key:'poolSize', label:'依題庫量' },
+  { key:'score', label:'依分數' },
+  { key:'questionCount', label:'依練習題數' },
+  { key:'duration', label:'依用時（最快優先）' }
+];
+function compareSubmissions(a, b, sortBy){
+  const psA = getPoolSize(a), psB = getPoolSize(b);
+  const durA = a.durationSec!=null ? a.durationSec : Infinity;
+  const durB = b.durationSec!=null ? b.durationSec : Infinity;
+  switch(sortBy){
+    case 'score':
+      return (b.score-a.score) || (psB-psA) || (b.total-a.total) || (durA-durB);
+    case 'poolSize':
+      return (psB-psA) || (b.score-a.score) || (b.total-a.total) || (durA-durB);
+    case 'questionCount':
+      return (b.total-a.total) || (b.score-a.score) || (psB-psA) || (durA-durB);
+    case 'duration':
+      return (durA-durB) || (b.score-a.score) || (psB-psA) || (b.total-a.total);
+    case 'combined':
+    default:
+      // 預設綜合排名：題庫量 → 分數 → 練習題數 → 用時
+      return (psB-psA) || (b.score-a.score) || (b.total-a.total) || (durA-durB);
+  }
+}
+
 function viewLeaderboard(){
   renderLeaderboardAsync();
   return `
@@ -1209,6 +1245,9 @@ function viewLeaderboard(){
         <h2 class="h-title">歷次成績排行</h2>
       </div>
       <button class="btn btn-ghost btn-sm" data-action="leaderboard-refresh">↻ 重新整理</button>
+    </div>
+    <div class="video-intro" style="margin-top:14px">
+      📊 <b>排序原則：</b>預設採「綜合排名」，依序比較<b>題庫量（挑戰的級別/影片單元涵蓋越多題庫越優先）→ 分數 → 練習題數 → 用時</b>，避免只選少數簡單題庫就衝上第一名。也可以在下面切換排序依據，單獨看某一項目的排名。
     </div>
     <div class="spacer-16"></div>
     <div id="lbFilters"></div>
@@ -1227,14 +1266,35 @@ async function renderLeaderboardAsync(){
 
   filterEl.innerHTML = `
     <div class="field-row" style="align-items:flex-end">
-      <div class="field" style="flex:1">
+      <div class="field" style="flex:1; min-width:160px">
         <label>依考題代碼篩選</label>
         <select id="lbCodeSelect">
           <option value="all">全部紀錄</option>
           ${codes.map(c=>`<option value="${esc(c.code)}" ${STATE.lbFilter===c.code?'selected':''}>${esc(c.code)}（${c.levels.map(k=>levelInfo(k).name).join('/')}）</option>`).join('')}
         </select>
       </div>
-      <div class="field" style="flex:1">
+      <div class="field" style="flex:1; min-width:160px">
+        <label>排序依據</label>
+        <select id="lbSortSelect">
+          ${LB_SORT_OPTIONS.map(o=>`<option value="${o.key}" ${STATE.lbSortBy===o.key?'selected':''}>${o.label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="flex:1; min-width:140px">
+        <label>顯示筆數</label>
+        <select id="lbLimitSelect">
+          <option value="50" ${STATE.lbLimit==='50'||STATE.lbLimit===50?'selected':''}>前 50 名</option>
+          <option value="100" ${STATE.lbLimit==='100'||STATE.lbLimit===100?'selected':''}>前 100 名</option>
+          <option value="200" ${STATE.lbLimit==='200'||STATE.lbLimit===200?'selected':''}>前 200 名</option>
+          <option value="all" ${STATE.lbLimit==='all'?'selected':''}>顯示全部</option>
+          <option value="custom" ${STATE.lbLimit==='custom'?'selected':''}>自訂...</option>
+        </select>
+      </div>
+      ${STATE.lbLimit==='custom' ? `
+      <div class="field" style="max-width:120px">
+        <label>自訂筆數</label>
+        <input type="number" id="lbCustomLimitInput" min="1" value="${esc(STATE.lbCustomLimit)}" placeholder="例如 30">
+      </div>` : ''}
+      <div class="field" style="flex:1; min-width:160px">
         <label>搜尋姓名／班級座號</label>
         <input type="text" id="lbSearchInput" value="${esc(STATE.lbSearch)}" placeholder="輸入姓名或班級座號">
       </div>
@@ -1244,24 +1304,38 @@ async function renderLeaderboardAsync(){
   if(STATE.lbFilter!=='all') filtered = filtered.filter(s=>s.examCode===STATE.lbFilter);
   if(STATE.lbSearch.trim()) filtered = filtered.filter(s=> (s.name||'').includes(STATE.lbSearch.trim()) || (s.seat||'').includes(STATE.lbSearch.trim()));
 
-  filtered = filtered.slice().sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
+  filtered = filtered.slice().sort((a,b)=> compareSubmissions(a,b,STATE.lbSortBy));
 
-  if(filtered.length===0){
+  let limitN = Infinity;
+  if(STATE.lbLimit==='custom'){
+    const n = parseInt(STATE.lbCustomLimit);
+    limitN = (n && n>0) ? n : Infinity;
+  } else if(STATE.lbLimit!=='all'){
+    limitN = parseInt(STATE.lbLimit);
+  }
+  const totalCount = filtered.length;
+  const shown = filtered.slice(0, limitN);
+
+  if(shown.length===0){
     contentEl.innerHTML = `<div class="empty-state">${ICONS.trophy}<p>目前還沒有符合條件的挑戰紀錄。</p></div>`;
   } else {
     const me = STATE.profile;
-    contentEl.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
-      <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>分數</th><th>正確/總題</th><th>用時</th><th>時間</th>
+    contentEl.innerHTML = `
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。</p>
+    <div class="tbl-wrap"><table><thead><tr>
+      <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
-    ${filtered.slice(0,100).map((s,i)=>{
+    ${shown.map((s,i)=>{
       const rank=i+1;
       const isMe = me.name && s.name===me.name && s.seat===me.seat;
+      const levelNames = (s.levels||[]).map(k=>levelInfo(k).name).join('、');
       return `<tr class="${isMe?'me':''}">
         <td><span class="rank-badge ${rank===1?'r1':rank===2?'r2':rank===3?'r3':''}">${rank}</span></td>
         <td>${esc(s.name)}</td>
         <td>${esc(s.seat||'—')}</td>
         <td>${esc(s.cls||'—')}</td>
         <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
+        <td title="${esc(levelNames)}">${getPoolSize(s)}題</td>
         <td><b>${s.score}分</b></td>
         <td>${s.correct}/${s.total}</td>
         <td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
@@ -1272,7 +1346,11 @@ async function renderLeaderboardAsync(){
   }
 
   filterEl.querySelector('#lbCodeSelect').onchange = (e)=>{ STATE.lbFilter=e.target.value; renderLeaderboardAsync(); };
+  filterEl.querySelector('#lbSortSelect').onchange = (e)=>{ STATE.lbSortBy=e.target.value; renderLeaderboardAsync(); };
+  filterEl.querySelector('#lbLimitSelect').onchange = (e)=>{ STATE.lbLimit=e.target.value; renderLeaderboardAsync(); };
   filterEl.querySelector('#lbSearchInput').oninput = (e)=>{ STATE.lbSearch=e.target.value; renderLeaderboardAsync(); };
+  const customInput = filterEl.querySelector('#lbCustomLimitInput');
+  if(customInput) customInput.oninput = (e)=>{ STATE.lbCustomLimit=e.target.value; renderLeaderboardAsync(); };
 }
 
 /* ================= TEACHER ================= */
@@ -1652,13 +1730,14 @@ async function finishSession(){
 
   if(sess.kind==='challenge'){
     const p = STATE.profile;
+    const poolSize = buildPool(new Set(sess.levels||[])).length;
     const record = {
       id: uid(), name:p.name, seat:p.seat, cls:p.cls,
       mode: sess.examCode ? 'group' : 'individual',
       examCode: sess.examCode || null,
       levels: sess.levels, total, correct: sess.correctCount,
       score: Math.round(sess.correctCount/total*100),
-      wrongQids, durationSec, timestamp: Date.now()
+      poolSize, wrongQids, durationSec, timestamp: Date.now()
     };
     await sSet('submission:'+Date.now()+'_'+uid(), JSON.stringify(record), true);
     STATE.cache.submissions = null;
