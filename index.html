@@ -594,37 +594,6 @@ async function sList(prefix='', shared=false){
     return snap.docs.map(d=>d.id);
   }catch(e){ console.error('Firestore list failed', prefix, e); return []; }
 }
-/* Like sList, but returns {key, value} pairs from a SINGLE query instead of one
-   round-trip per key. Firestore already hands back full document data as part of
-   the listing query — sList+per-key sGet was throwing that data away and re-fetching
-   it one document at a time, which is why the leaderboard/teacher dashboard felt slow
-   once there were dozens of submissions. This is the fast path those views should use. */
-async function sListWithValues(prefix='', shared=false){
-  if(!shared){
-    try{
-      const out=[];
-      for(let i=0;i<localStorage.length;i++){
-        const k = localStorage.key(i);
-        if(k && k.startsWith(LOCAL_PREFIX)){
-          const orig = k.slice(LOCAL_PREFIX.length);
-          if(!prefix || orig.startsWith(prefix)) out.push({key:orig, value:localStorage.getItem(k)});
-        }
-      }
-      return out;
-    }catch(e){ return []; }
-  }
-  if(!firebaseReady) return [];
-  try{
-    let query = db.collection('kv');
-    if(prefix){
-      const end = prefix.slice(0,-1) + String.fromCharCode(prefix.charCodeAt(prefix.length-1)+1);
-      query = query.where(firebase.firestore.FieldPath.documentId(), '>=', prefix)
-                   .where(firebase.firestore.FieldPath.documentId(), '<', end);
-    }
-    const snap = await query.get();
-    return snap.docs.map(d=>({ key:d.id, value: d.data() ? d.data().value : null }));
-  }catch(e){ console.error('Firestore list-with-values failed', prefix, e); return []; }
-}
 async function getJSON(key, shared=false, fallback=null){
   const v = await sGet(key, shared);
   if(v===null) return fallback;
@@ -801,7 +770,7 @@ function render(){
 function brandbar(){
   const p = STATE.profile;
   const chip = p.name ? `<div class="profile-chip" data-action="edit-profile" style="cursor:pointer">
-      <span class="dot">${esc(p.name[0]||'?')}</span>${esc(p.name)}${p.seat?(' · '+esc(p.seat)+'號'):''}
+      <span class="dot">${esc(p.name[0]||'?')}</span>${esc(p.name)}${p.seat?(' · '+esc(p.seat)):''}
     </div>` : '';
   return `
   <div class="brandbar">
@@ -855,7 +824,7 @@ function viewHome(){
       <button class="mode-card" data-action="go" data-view="challenge-entry">
         <span class="ic">${ICONS.trophy}</span>
         <b>挑戰區</b>
-        <span>輸入姓名座號，個人挑戰或用代碼和全班一起team battle！</span>
+        <span>輸入姓名班級座號，個人挑戰或用代碼和全班一起team battle！</span>
       </button>
     </div>
     <div class="hero-note">📌 競賽題目命題範圍包含政府政策及時事、「環境教育終身學習網」之指定影片及環境知識相關議題。</div>
@@ -1090,14 +1059,14 @@ function viewChallengeEntry(){
   <div class="card">
     <span class="section-eyebrow">${icon('trophy',16)} 挑戰區</span>
     <h2 class="h-title">先告訴我你是誰</h2>
-    <p class="h-sub">姓名和座號會用來記錄你的成績，讓老師和你自己都能看到學習狀況。</p>
+    <p class="h-sub">姓名和班級座號會用來記錄你的成績，讓老師和你自己都能看到學習狀況。</p>
     <div class="spacer-16"></div>
     <div id="entryError"></div>
     <div class="field-row">
       <div class="field"><label>姓名 *</label><input type="text" id="fName" value="${esc(p.name)}" placeholder="例如：王小明"></div>
-      <div class="field"><label>座號 *</label><input type="text" id="fSeat" value="${esc(p.seat)}" placeholder="例如：12"></div>
+      <div class="field"><label>班級座號 *</label><input type="text" id="fSeat" value="${esc(p.seat)}" placeholder="例如：503 02"></div>
     </div>
-    <div class="field"><label>班級（選填）</label><input type="text" id="fCls" value="${esc(p.cls)}" placeholder="例如：五年三班"></div>
+    <div class="field"><label>學校（選填）</label><input type="text" id="fCls" value="${esc(p.cls)}" placeholder="例如：某某國小"></div>
     <button class="btn btn-primary btn-block" data-action="challenge-entry-submit">下一步 →</button>
   </div>`;
 }
@@ -1107,7 +1076,7 @@ function viewChallengeMenu(){
   return `
   <button class="backlink" data-action="go" data-view="home">← 返回首頁</button>
   <div class="card">
-    <span class="section-eyebrow">歡迎，${esc(p.name)}${p.seat?(' · '+esc(p.seat)+'號'):''}</span>
+    <span class="section-eyebrow">歡迎，${esc(p.name)}${p.seat?(' · '+esc(p.seat)):''}</span>
     <h2 class="h-title">選擇挑戰模式</h2>
     <div class="spacer-16"></div>
     <div class="mode-grid">
@@ -1125,7 +1094,7 @@ function viewChallengeMenu(){
     <div class="spacer-16"></div>
     <div class="btnrow">
       <button class="btn btn-ghost" data-action="go" data-view="leaderboard">${icon('trophy',16)} 查看排行榜</button>
-      <button class="btn btn-ghost" data-action="edit-profile">修改姓名／座號</button>
+      <button class="btn btn-ghost" data-action="edit-profile">修改姓名／班級座號</button>
     </div>
   </div>`;
 }
@@ -1202,22 +1171,28 @@ function viewCodeReady(){
 /* ================= LEADERBOARD ================= */
 async function fetchAllSubmissions(force=false){
   if(STATE.cache.submissions && !force) return STATE.cache.submissions;
-  const entries = await sListWithValues('submission:', true);
-  entries.sort((a,b)=> a.key < b.key ? 1 : (a.key > b.key ? -1 : 0)); // newest first (keys are timestamp-prefixed)
-  const limited = entries.slice(0, 1000);
+  const keys = await sList('submission:', true);
+  const sorted = keys.slice().sort().reverse(); // newest first (keys are timestamp-prefixed)
+  const limited = sorted.slice(0, 1000);
+  // Fetch every record in parallel instead of one-at-a-time — this is what made
+  // the leaderboard/teacher dashboard feel slow once there were dozens of entries.
+  // (Uses the exact same sGet()/sList() calls that were already confirmed working —
+  // only the sequencing changed, not the underlying Firestore query.)
+  const values = await Promise.all(limited.map(k => sGet(k, true)));
   const results = [];
-  for(const {value} of limited){
-    if(value){ try{ results.push(JSON.parse(value)); }catch(e){} }
+  for(const v of values){
+    if(v){ try{ results.push(JSON.parse(v)); }catch(e){} }
   }
   STATE.cache.submissions = results;
   return results;
 }
 async function fetchAllExamCodes(force=false){
   if(STATE.cache.examcodes && !force) return STATE.cache.examcodes;
-  const entries = await sListWithValues('examcode:', true);
+  const keys = await sList('examcode:', true);
+  const values = await Promise.all(keys.map(k => sGet(k, true)));
   const results = [];
-  for(const {value} of entries){
-    if(value){ try{ results.push(JSON.parse(value)); }catch(e){} }
+  for(const v of values){
+    if(v){ try{ results.push(JSON.parse(v)); }catch(e){} }
   }
   STATE.cache.examcodes = results;
   return results;
@@ -1260,8 +1235,8 @@ async function renderLeaderboardAsync(){
         </select>
       </div>
       <div class="field" style="flex:1">
-        <label>搜尋姓名／座號</label>
-        <input type="text" id="lbSearchInput" value="${esc(STATE.lbSearch)}" placeholder="輸入姓名或座號">
+        <label>搜尋姓名／班級座號</label>
+        <input type="text" id="lbSearchInput" value="${esc(STATE.lbSearch)}" placeholder="輸入姓名或班級座號">
       </div>
     </div>`;
 
@@ -1276,7 +1251,7 @@ async function renderLeaderboardAsync(){
   } else {
     const me = STATE.profile;
     contentEl.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
-      <th>名次</th><th>姓名</th><th>班級/座號</th><th>模式</th><th>分數</th><th>正確/總題</th><th>用時</th><th>時間</th>
+      <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>分數</th><th>正確/總題</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
     ${filtered.slice(0,100).map((s,i)=>{
       const rank=i+1;
@@ -1284,7 +1259,8 @@ async function renderLeaderboardAsync(){
       return `<tr class="${isMe?'me':''}">
         <td><span class="rank-badge ${rank===1?'r1':rank===2?'r2':rank===3?'r3':''}">${rank}</span></td>
         <td>${esc(s.name)}</td>
-        <td>${esc(s.cls||'—')} ${s.seat?('/ '+esc(s.seat)+'號'):''}</td>
+        <td>${esc(s.seat||'—')}</td>
+        <td>${esc(s.cls||'—')}</td>
         <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
         <td><b>${s.score}分</b></td>
         <td>${s.correct}/${s.total}</td>
@@ -1367,7 +1343,7 @@ async function renderTeacherAsync(forceRefresh=false){
   else if(STATE.teacherTab==='records'){
     const sorted = subs.slice().sort((a,b)=>b.timestamp-a.timestamp);
     el.innerHTML = `
-      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="搜尋姓名／座號／代碼" value="${esc(STATE.lbSearch)}"></div>
+      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
       <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV</button>
@@ -1376,14 +1352,14 @@ async function renderTeacherAsync(forceRefresh=false){
       const q = (document.getElementById('teacherSearch').value||'').trim();
       const rows = q ? sorted.filter(s=>(s.name||'').includes(q)||(s.seat||'').includes(q)||(s.examCode||'').includes(q)||(s.cls||'').includes(q)) : sorted;
       document.getElementById('teacherRecordsTbl').innerHTML = `<div class="tbl-wrap"><table><thead><tr>
-        <th>時間</th><th>姓名</th><th>班級/座號</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
+        <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
       </tr></thead><tbody>
       ${rows.slice(0,300).map(s=>`<tr>
-        <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.cls||'—')} ${s.seat?('/'+esc(s.seat)):''}</td>
+        <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
         <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
         <td>${(s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
         <td><b>${s.score}</b></td><td>${s.correct}/${s.total}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
-      </tr>`).join('') || '<tr><td colspan="8" class="muted">沒有符合的紀錄</td></tr>'}
+      </tr>`).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
       </tbody></table></div>`;
     };
     draw();
@@ -1498,7 +1474,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     const seat = document.getElementById('fSeat').value.trim();
     const cls = document.getElementById('fCls').value.trim();
     if(!name || !seat){
-      document.getElementById('entryError').innerHTML = `<div class="errmsg">請輸入姓名和座號才能進入挑戰區喔！</div>`;
+      document.getElementById('entryError').innerHTML = `<div class="errmsg">請輸入姓名和班級座號才能進入挑戰區喔！</div>`;
       return;
     }
     STATE.profile = {name, seat, cls};
@@ -1750,7 +1726,7 @@ async function teacherLoginSubmit(){
 
 async function copyRecordsCsv(){
   const subs = await fetchAllSubmissions();
-  const header = ['時間','姓名','班級','座號','模式','考題代碼','級別','分數','正確題數','總題數','用時(秒)'];
+  const header = ['時間','姓名','學校','班級座號','模式','考題代碼','級別','分數','正確題數','總題數','用時(秒)'];
   const lines = [header.join(',')];
   subs.slice().sort((a,b)=>b.timestamp-a.timestamp).forEach(s=>{
     lines.push([fmtTime(s.timestamp), s.name, s.cls||'', s.seat||'', s.mode, s.examCode||'', (s.levels||[]).map(k=>levelInfo(k).name).join('/'), s.score, s.correct, s.total, s.durationSec||''].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
