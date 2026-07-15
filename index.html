@@ -509,6 +509,11 @@ const VIDEO_LIST = [
   { number:5, levelKey:8, title:'無形文化資產中的傳統知識與實踐', key:'6097F00C8675F7C8C56D94C59823849F' },
   { number:6, levelKey:6, title:'綠色能源：新及再生能源對淨零推動', key:'A34103D78009F1B40CCD54BD311C0A20' }
 ].map(v => ({ ...v, url: VIDEO_BASE_URL + v.key }));
+/* Leaderboard integrity rule: challenges answered with very few questions (e.g. 1)
+   are trivial to spam for a fluke 100% score, drowning out meaningful attempts.
+   Submissions below this threshold are excluded from the public ranking but are
+   still stored and remain visible in the student's own history and to teachers. */
+const MIN_LEADERBOARD_QUESTIONS = 20;
 function icon(name,size=40){ return `<span style="display:inline-block;width:${size}px;height:${size}px">${ICONS[name]||''}</span>`; }
 
 function renderLevelCard(l, selectedSet){
@@ -760,6 +765,7 @@ function render(){
     case 'challenge-session': html = viewSession('challenge'); break;
     case 'challenge-summary': html = viewSummary('challenge'); break;
     case 'leaderboard': html = viewLeaderboard(); break;
+    case 'my-history': html = viewMyHistory(); break;
     case 'teacher-login': html = viewTeacherLogin(); break;
     case 'teacher-dashboard': html = viewTeacherDashboard(); break;
     default: html = viewHome();
@@ -1097,6 +1103,7 @@ function viewChallengeMenu(){
     <div class="spacer-16"></div>
     <div class="btnrow">
       <button class="btn btn-ghost" data-action="go" data-view="leaderboard">${icon('trophy',16)} 查看排行榜</button>
+      <button class="btn btn-ghost" data-action="go" data-view="my-history">${icon('target',16)} 我的挑戰紀錄</button>
       <button class="btn btn-ghost" data-action="edit-profile">修改姓名／班級座號</button>
     </div>
   </div>`;
@@ -1234,6 +1241,54 @@ function compareSubmissions(a, b, sortBy){
   }
 }
 
+function viewMyHistory(){
+  renderMyHistoryAsync();
+  return `
+  <button class="backlink" data-action="go" data-view="${STATE.profile.name?'challenge-menu':'home'}">← 返回</button>
+  <div class="card">
+    <span class="section-eyebrow">${icon('target',16)} 個人專屬</span>
+    <h2 class="h-title">我的挑戰紀錄</h2>
+    <p class="h-sub">這裡會列出你所有的挑戰成績，包含未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻、沒有出現在排行榜上的紀錄。</p>
+    <div class="spacer-16"></div>
+    <div id="myHistoryContent"><div class="loading"><span class="spin"></span>載入紀錄中…</div></div>
+  </div>`;
+}
+
+async function renderMyHistoryAsync(){
+  const subs = await fetchAllSubmissions();
+  if(STATE.view!=='my-history') return;
+  const el = document.getElementById('myHistoryContent');
+  if(!el) return;
+
+  const p = STATE.profile;
+  if(!p.name || !p.seat){
+    el.innerHTML = `<div class="empty-state">${ICONS.target}<p>請先到挑戰區輸入姓名與班級座號，才能查看個人紀錄。</p>
+      <button class="btn btn-secondary btn-sm" data-action="go" data-view="challenge-entry">前往輸入</button></div>`;
+    return;
+  }
+  const mine = subs.filter(s=> s.name===p.name && s.seat===p.seat).sort((a,b)=>b.timestamp-a.timestamp);
+  if(mine.length===0){
+    el.innerHTML = `<div class="empty-state">${ICONS.target}<p>你還沒有任何挑戰紀錄，去挑戰區試試看吧！</p></div>`;
+    return;
+  }
+  el.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
+    <th>時間</th><th>模式</th><th>級別</th><th>分數</th><th>練習題數</th><th>用時</th><th>是否列入排行榜</th>
+  </tr></thead><tbody>
+  ${mine.map(s=>{
+    const ranked = s.total >= MIN_LEADERBOARD_QUESTIONS;
+    return `<tr>
+      <td>${fmtTime(s.timestamp)}</td>
+      <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
+      <td>${(s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
+      <td><b>${s.score}分</b></td>
+      <td>${s.correct}/${s.total}</td>
+      <td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
+      <td>${ranked ? '<span style="color:var(--forest-700);font-weight:700">✓ 已列入</span>' : `<span class="muted">未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻</span>`}</td>
+    </tr>`;
+  }).join('')}
+  </tbody></table></div>`;
+}
+
 function viewLeaderboard(){
   renderLeaderboardAsync();
   return `
@@ -1247,7 +1302,8 @@ function viewLeaderboard(){
       <button class="btn btn-ghost btn-sm" data-action="leaderboard-refresh">↻ 重新整理</button>
     </div>
     <div class="video-intro" style="margin-top:14px">
-      📊 <b>排序原則：</b>預設採「綜合排名」，依序比較<b>題庫量（挑戰的級別/影片單元涵蓋越多題庫越優先）→ 分數 → 練習題數 → 用時</b>，避免只選少數簡單題庫就衝上第一名。也可以在下面切換排序依據，單獨看某一項目的排名。
+      📊 <b>排序原則：</b>預設採「綜合排名」，依序比較<b>題庫量（挑戰的級別/影片單元涵蓋越多題庫越優先）→ 分數 → 練習題數 → 用時</b>，避免只選少數簡單題庫就衝上第一名。也可以在下面切換排序依據，單獨看某一項目的排名。<br>
+      🛡️ <b>入榜門檻：</b>單次挑戰需作答滿 <b>${MIN_LEADERBOARD_QUESTIONS} 題</b>才會列入排行榜，避免用極少題數刷出無意義的高分；未達門檻的成績仍會保留，可在「我的挑戰紀錄」查看。
     </div>
     <div class="spacer-16"></div>
     <div id="lbFilters"></div>
@@ -1300,7 +1356,8 @@ async function renderLeaderboardAsync(){
       </div>
     </div>`;
 
-  let filtered = subs;
+  let filtered = subs.filter(s=> s.total >= MIN_LEADERBOARD_QUESTIONS);
+  const excludedCount = subs.length - filtered.length;
   if(STATE.lbFilter!=='all') filtered = filtered.filter(s=>s.examCode===STATE.lbFilter);
   if(STATE.lbSearch.trim()) filtered = filtered.filter(s=> (s.name||'').includes(STATE.lbSearch.trim()) || (s.seat||'').includes(STATE.lbSearch.trim()));
 
@@ -1317,11 +1374,11 @@ async function renderLeaderboardAsync(){
   const shown = filtered.slice(0, limitN);
 
   if(shown.length===0){
-    contentEl.innerHTML = `<div class="empty-state">${ICONS.trophy}<p>目前還沒有符合條件的挑戰紀錄。</p></div>`;
+    contentEl.innerHTML = `<div class="empty-state">${ICONS.trophy}<p>目前還沒有符合條件的挑戰紀錄。</p>${STATE.profile.name?`<button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history">查看我的挑戰紀錄</button>`:''}</div>`;
   } else {
     const me = STATE.profile;
     contentEl.innerHTML = `
-    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。</p>
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedCount>0?` 另有 <b>${excludedCount}</b> 筆因未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻未列入。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
     <div class="tbl-wrap"><table><thead><tr>
       <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
@@ -1422,6 +1479,7 @@ async function renderTeacherAsync(forceRefresh=false){
     const sorted = subs.slice().sort((a,b)=>b.timestamp-a.timestamp);
     el.innerHTML = `
       <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
+      <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻，不會出現在排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
       <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV</button>
@@ -1432,12 +1490,15 @@ async function renderTeacherAsync(forceRefresh=false){
       document.getElementById('teacherRecordsTbl').innerHTML = `<div class="tbl-wrap"><table><thead><tr>
         <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
       </tr></thead><tbody>
-      ${rows.slice(0,300).map(s=>`<tr>
+      ${rows.slice(0,300).map(s=>{
+        const belowThreshold = s.total < MIN_LEADERBOARD_QUESTIONS;
+        return `<tr${belowThreshold?' style="opacity:0.55"':''}>
         <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
         <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
         <td>${(s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
-        <td><b>${s.score}</b></td><td>${s.correct}/${s.total}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
-      </tr>`).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
+        <td><b>${s.score}</b></td><td>${s.correct}/${s.total}${belowThreshold?' ⚠️':''}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
+      </tr>`;
+      }).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
       </tbody></table></div>`;
     };
     draw();
