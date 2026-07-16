@@ -500,15 +500,14 @@ const VIDEO_FULL_TITLES = {
 /* Video watch list — number matches the "影片N" tag used in level cards / question bank.
    levelKey links each video to its matching question category so students can jump
    straight from "watch" to "practice this topic". */
-const VIDEO_BASE_URL = 'https://elearn.moenv.gov.tw/DigitalLearning/WatchVideo.aspx?type=2&key=';
 const VIDEO_LIST = [
-  { number:1, levelKey:9, title:'綠生活家園～"化"出環境友善的生活方式', key:'5A1A257A0AD77940BA8A99A789E707BE' },
-  { number:2, levelKey:5, title:'臺灣2050淨零排放路徑及政策（低碳環境教育）', key:'EF212EF679237A1F3999A52F997D6197' },
-  { number:3, levelKey:7, title:'環境倫理', key:'903F2631D63EFF9734CE4310820F46B4' },
-  { number:4, levelKey:4, title:'【InnoConnect＋ 2024 線上講堂】循環經濟×紡織，重塑生產與消費模式', key:'04BC57CA70BCA6C73153A5233CF2CDC4' },
-  { number:5, levelKey:8, title:'無形文化資產中的傳統知識與實踐', key:'6097F00C8675F7C8C56D94C59823849F' },
-  { number:6, levelKey:6, title:'綠色能源：新及再生能源對淨零推動', key:'A34103D78009F1B40CCD54BD311C0A20' }
-].map(v => ({ ...v, url: VIDEO_BASE_URL + v.key }));
+  { number:1, levelKey:9, title:'綠生活家園～"化"出環境友善的生活方式', url:'https://www.youtube.com/watch?v=8pYnAdtORJo&t=1s' },
+  { number:2, levelKey:5, title:'臺灣2050淨零排放路徑及政策（低碳環境教育）', url:'https://www.youtube.com/watch?v=9ttvscbrxB0&t=1s' },
+  { number:3, levelKey:7, title:'環境倫理', url:'https://www.youtube.com/watch?v=x1LmXRF09rM&t=1s' },
+  { number:4, levelKey:4, title:'【InnoConnect＋ 2024 線上講堂】循環經濟×紡織，重塑生產與消費模式', url:'https://www.youtube.com/watch?v=CTHJoEnoEb4&t=1s' },
+  { number:5, levelKey:8, title:'無形文化資產中的傳統知識與實踐', url:'https://www.youtube.com/watch?v=5DNM0qqFfFc&t=1s' },
+  { number:6, levelKey:6, title:'綠色能源：新及再生能源對淨零推動', url:'https://www.youtube.com/watch?v=7MLXn1oazQg&t=1s' }
+];
 /* Leaderboard integrity rule: challenges answered with very few questions (e.g. 1)
    are trivial to spam for a fluke 100% score, drowning out meaningful attempts.
    Submissions below this threshold are excluded from the public ranking but are
