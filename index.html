@@ -135,6 +135,9 @@ input{font-family:inherit;}
 .hero-canopy{position:absolute; right:-30px; top:-30px; width:220px; height:220px; opacity:0.9; pointer-events:none;}
 .mode-grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:22px;}
 @media (max-width:560px){.mode-grid{grid-template-columns:1fr;}}
+.mode-grid.cols-3{grid-template-columns:1fr 1fr 1fr;}
+@media (max-width:760px){.mode-grid.cols-3{grid-template-columns:1fr 1fr;}}
+@media (max-width:560px){.mode-grid.cols-3{grid-template-columns:1fr;}}
 .mode-card{
   background:rgba(255,255,255,0.96); border-radius:var(--radius-md); padding:18px 18px 20px;
   cursor:pointer; text-align:left; border:none; color:var(--ink-900);
@@ -217,6 +220,13 @@ input{font-family:inherit;}
 
 /* ---------- Progress trail ---------- */
 .trail-wrap{margin-bottom:20px;}
+.mock-banner{
+  display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;
+  background:var(--forest-900); color:#fff; padding:12px 18px; border-radius:var(--radius-md);
+  font-size:0.86rem; font-weight:600; margin-bottom:16px;
+}
+.mock-timer{font-family:var(--font-display); font-weight:800; font-size:0.98rem; background:rgba(255,255,255,0.14); padding:4px 12px; border-radius:999px;}
+.mock-timer.low{background:var(--coral-500); animation:blink 1.4s ease-in-out infinite;}
 .trail{display:flex; gap:5px; flex-wrap:wrap;}
 .trail i{
   width:15px;height:15px;border-radius:50%; background:var(--line); flex:none; display:block;
@@ -513,6 +523,12 @@ const VIDEO_LIST = [
    Submissions below this threshold are excluded from the public ranking but are
    still stored and remain visible in the student's own history and to teachers. */
 const MIN_LEADERBOARD_QUESTIONS = 20;
+/* 考前模擬區：比照正式考試第一階段設定 — 全題庫（含影片單元）、80 題、限時 30 分鐘。
+   這個模式有自己獨立的排行榜與入榜門檻（60 分），跟一般練習/挑戰的排行榜分開計算。 */
+const MOCK_EXAM_QUESTION_COUNT = 80;
+const MOCK_EXAM_DURATION_SEC = 30 * 60;
+const MOCK_EXAM_MIN_SCORE = 60;
+const MOCK_EXAM_ALL_LEVELS = LEVELS.map(l=>l.key);
 function icon(name,size=40){ return `<span style="display:inline-block;width:${size}px;height:${size}px">${ICONS[name]||''}</span>`; }
 
 function renderLevelCard(l, selectedSet){
@@ -699,7 +715,9 @@ const STATE = {
   cache:{ submissions:null, examcodes:null },
   loading:false,
   importBusy:false,
-  importError:null
+  importError:null,
+  mockTimerHandle:null,   // setInterval id for the live countdown, cleared on exit/finish
+  mockLbLimit:50
 };
 
 async function loadPersonal(){
@@ -765,6 +783,8 @@ function render(){
     case 'challenge-summary': html = viewSummary('challenge'); break;
     case 'leaderboard': html = viewLeaderboard(); break;
     case 'my-history': html = viewMyHistory(); break;
+    case 'mock-exam-intro': html = viewMockExamIntro(); break;
+    case 'mock-leaderboard': html = viewMockLeaderboard(); break;
     case 'teacher-login': html = viewTeacherLogin(); break;
     case 'teacher-dashboard': html = viewTeacherDashboard(); break;
     default: html = viewHome();
@@ -996,9 +1016,11 @@ function viewSession(kind){
 
   const canNext = isPractice ? answered : sel!=null;
   const isLast = sess.idx === total-1;
+  const isMock = sess.examType==='mock';
 
   return `
   <button class="backlink" data-action="confirm-exit-session">← 中途離開</button>
+  ${isMock ? `<div class="mock-banner">📝 考前模擬考 · 全題庫 ${total} 題 · 限時 ${MOCK_EXAM_DURATION_SEC/60} 分鐘 <span id="mockTimerDisplay">${mockTimerHtml(sess.endTime-Date.now())}</span></div>` : ''}
   <div class="trail-wrap">
     <div class="trail">${trail}</div>
     <div class="trail-meta"><span>第 ${sess.idx+1} / ${total} 題</span><span>${isPractice?'答對 '+sess.correctCount+' 題':'作答模式 · 送出後才會顯示結果'}</span></div>
@@ -1021,19 +1043,23 @@ function viewSummary(kind){
   if(!sum) return viewHome();
   const pct = Math.round(sum.correct/sum.total*100);
   const isPractice = kind==='practice';
+  const isMock = sum.examType==='mock';
   const treeStage = pct>=85?'tree':pct>=60?'sapling':pct>=35?'sprout':'seed';
+  const score = Math.round(sum.correct/sum.total*100);
+  const mockPassed = score >= MOCK_EXAM_MIN_SCORE;
 
   return `
   <button class="backlink" data-action="go" data-view="home">← 返回首頁</button>
   <div class="card center">
-    <span class="section-eyebrow">${isPractice?'練習完成':'挑戰結果'}</span>
+    <span class="section-eyebrow">${isMock ? '考前模擬結果' : (isPractice?'練習完成':'挑戰結果')}</span>
     <div style="width:80px;margin:8px auto 4px">${ICONS[treeStage]}</div>
     <div class="bignum">${sum.correct} <span style="font-size:1.4rem;color:var(--ink-400)">/ ${sum.total}</span></div>
     <p class="h-sub">正確率 ${pct}%${sum.durationSec!=null ? ` · 花費時間 ${fmtDuration(sum.durationSec)}`:''}</p>
+    ${isMock ? `<p class="hint" style="margin-top:10px">${mockPassed ? `✅ 已達 ${MOCK_EXAM_MIN_SCORE} 分門檻，成績會列入<b>模擬考排行榜</b>！` : `未達 ${MOCK_EXAM_MIN_SCORE} 分入榜門檻，再接再厲！這次成績仍會保留在你的個人紀錄中。`}</p>` : ''}
     ${sum.examCode ? `<p class="hint" style="margin-top:10px">考題代碼：<b>${esc(sum.examCode)}</b></p>` : ''}
     <div class="spacer-24"></div>
     <div class="btnrow" style="justify-content:center">
-      ${isPractice ? `<button class="btn btn-primary" data-action="go" data-view="practice-setup">再練一次</button>` : `<button class="btn btn-primary" data-action="go" data-view="leaderboard">查看排行榜</button>`}
+      ${isPractice ? `<button class="btn btn-primary" data-action="go" data-view="practice-setup">再練一次</button>` : `<button class="btn btn-primary" data-action="go" data-view="${isMock?'mock-leaderboard':'leaderboard'}">查看${isMock?'模擬考':''}排行榜</button>`}
       <button class="btn btn-ghost" data-action="go" data-view="home">回首頁</button>
     </div>
   </div>
@@ -1087,7 +1113,7 @@ function viewChallengeMenu(){
     <span class="section-eyebrow">歡迎，${esc(p.name)}${p.seat?(' · '+esc(p.seat)):''}</span>
     <h2 class="h-title">選擇挑戰模式</h2>
     <div class="spacer-16"></div>
-    <div class="mode-grid">
+    <div class="mode-grid cols-3">
       <button class="mode-card" data-action="go" data-view="challenge-individual-setup">
         <span class="ic">${icon('target',38)}</span>
         <b>個人挑戰</b>
@@ -1098,10 +1124,16 @@ function viewChallengeMenu(){
         <b>團體挑戰</b>
         <span>用同一組代碼，和全班比同一份題目！</span>
       </button>
+      <button class="mode-card" data-action="go" data-view="mock-exam-intro">
+        <span class="ic">${icon('clipboard',38)}</span>
+        <b>考前模擬</b>
+        <span>全題庫 ${MOCK_EXAM_QUESTION_COUNT} 題、限時 ${MOCK_EXAM_DURATION_SEC/60} 分鐘，完全比照正式考試。</span>
+      </button>
     </div>
     <div class="spacer-16"></div>
     <div class="btnrow">
       <button class="btn btn-ghost" data-action="go" data-view="leaderboard">${icon('trophy',16)} 查看排行榜</button>
+      <button class="btn btn-ghost" data-action="go" data-view="mock-leaderboard">${icon('clipboard',16)} 模擬考排行榜</button>
       <button class="btn btn-ghost" data-action="go" data-view="my-history">${icon('target',16)} 我的挑戰紀錄</button>
       <button class="btn btn-ghost" data-action="edit-profile">修改姓名／班級座號</button>
     </div>
@@ -1240,6 +1272,11 @@ function compareSubmissions(a, b, sortBy){
   }
 }
 
+function submissionModeLabel(s){
+  if(s.examType==='mock') return '📝 考前模擬考';
+  if(s.mode==='group') return '團體 '+esc(s.examCode);
+  return '個人';
+}
 function viewMyHistory(){
   renderMyHistoryAsync();
   return `
@@ -1274,18 +1311,117 @@ async function renderMyHistoryAsync(){
     <th>時間</th><th>模式</th><th>級別</th><th>分數</th><th>練習題數</th><th>用時</th><th>是否列入排行榜</th>
   </tr></thead><tbody>
   ${mine.map(s=>{
-    const ranked = s.total >= MIN_LEADERBOARD_QUESTIONS;
+    const isMock = s.examType==='mock';
+    const ranked = isMock ? (s.score >= MOCK_EXAM_MIN_SCORE) : (s.total >= MIN_LEADERBOARD_QUESTIONS);
+    const notRankedLabel = isMock ? `未達 ${MOCK_EXAM_MIN_SCORE} 分門檻` : `未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻`;
     return `<tr>
       <td>${fmtTime(s.timestamp)}</td>
-      <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
-      <td>${(s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
+      <td>${submissionModeLabel(s)}</td>
+      <td>${isMock ? '全題庫' : (s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
       <td><b>${s.score}分</b></td>
       <td>${s.correct}/${s.total}</td>
       <td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
-      <td>${ranked ? '<span style="color:var(--forest-700);font-weight:700">✓ 已列入</span>' : `<span class="muted">未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻</span>`}</td>
+      <td>${ranked ? '<span style="color:var(--forest-700);font-weight:700">✓ 已列入</span>' : `<span class="muted">${notRankedLabel}</span>`}</td>
     </tr>`;
   }).join('')}
   </tbody></table></div>`;
+}
+
+function viewMockExamIntro(){
+  const pool = buildPool(new Set(MOCK_EXAM_ALL_LEVELS));
+  return `
+  <button class="backlink" data-action="go" data-view="challenge-menu">← 返回</button>
+  <div class="card">
+    <span class="section-eyebrow">${icon('clipboard',16)} 考前模擬</span>
+    <h2 class="h-title">正式考試模擬測驗</h2>
+    <p class="h-sub">完全比照正式考試第一階段的設定，測試前務必先確認自己的實力！</p>
+    <div class="spacer-16"></div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="num">${MOCK_EXAM_QUESTION_COUNT}</div><div class="lbl">題（全題庫抽選）</div></div>
+      <div class="stat-tile"><div class="num">${MOCK_EXAM_DURATION_SEC/60}</div><div class="lbl">分鐘限時</div></div>
+      <div class="stat-tile"><div class="num">${MOCK_EXAM_MIN_SCORE}</div><div class="lbl">分以上才列入模擬考排行榜</div></div>
+      <div class="stat-tile"><div class="num">${pool.length}</div><div class="lbl">目前總題庫數</div></div>
+    </div>
+    <div class="video-intro">
+      📝 題目會從<b>所有級別與影片單元（含初級～高級、影片1～6）</b>隨機抽出 ${MOCK_EXAM_QUESTION_COUNT} 題。作答方式跟正式挑戰一樣，選完不會馬上看到對錯，送出後才會顯示結果與詳解。時間一到會自動送出，記得掌握作答節奏！
+    </div>
+    <div class="spacer-16"></div>
+    <div class="btnrow">
+      <button class="btn btn-primary" data-action="start-mock-exam">開始模擬考 →</button>
+      <button class="btn btn-ghost" data-action="go" data-view="mock-leaderboard">查看模擬考排行榜</button>
+    </div>
+  </div>`;
+}
+
+async function renderMockLeaderboardAsync(){
+  const subs = await fetchAllSubmissions();
+  if(STATE.view!=='mock-leaderboard') return;
+  const el = document.getElementById('mockLbContent');
+  const filterEl = document.getElementById('mockLbFilters');
+  if(!el || !filterEl) return;
+
+  filterEl.innerHTML = `
+    <div class="field" style="max-width:200px">
+      <label>顯示筆數</label>
+      <select id="mockLbLimitSelect">
+        <option value="50" ${STATE.mockLbLimit==='50'||STATE.mockLbLimit===50?'selected':''}>前 50 名</option>
+        <option value="100" ${STATE.mockLbLimit==='100'||STATE.mockLbLimit===100?'selected':''}>前 100 名</option>
+        <option value="all" ${STATE.mockLbLimit==='all'?'selected':''}>顯示全部</option>
+      </select>
+    </div>`;
+
+  const mockSubs = subs.filter(s=> s.examType==='mock' && s.score >= MOCK_EXAM_MIN_SCORE);
+  mockSubs.sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
+  const limitN = STATE.mockLbLimit==='all' ? Infinity : parseInt(STATE.mockLbLimit);
+  const shown = mockSubs.slice(0, limitN);
+
+  if(shown.length===0){
+    el.innerHTML = `<div class="empty-state">${ICONS.clipboard}<p>目前還沒有達到 ${MOCK_EXAM_MIN_SCORE} 分門檻的模擬考成績。</p></div>`;
+  } else {
+    const me = STATE.profile;
+    el.innerHTML = `
+    <p class="hint" style="margin-bottom:10px">符合門檻共 <b>${mockSubs.length}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。</p>
+    <div class="tbl-wrap"><table><thead><tr>
+      <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>分數</th><th>正確/總題</th><th>用時</th><th>時間</th>
+    </tr></thead><tbody>
+    ${shown.map((s,i)=>{
+      const rank=i+1;
+      const isMe = me.name && s.name===me.name && s.seat===me.seat;
+      return `<tr class="${isMe?'me':''}">
+        <td><span class="rank-badge ${rank===1?'r1':rank===2?'r2':rank===3?'r3':''}">${rank}</span></td>
+        <td>${esc(s.name)}</td>
+        <td>${esc(s.seat||'—')}</td>
+        <td>${esc(s.cls||'—')}</td>
+        <td><b>${s.score}分</b></td>
+        <td>${s.correct}/${s.total}</td>
+        <td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
+        <td>${fmtTime(s.timestamp)}</td>
+      </tr>`;
+    }).join('')}
+    </tbody></table></div>`;
+  }
+  filterEl.querySelector('#mockLbLimitSelect').onchange = (e)=>{ STATE.mockLbLimit=e.target.value; renderMockLeaderboardAsync(); };
+}
+
+function viewMockLeaderboard(){
+  renderMockLeaderboardAsync();
+  return `
+  <button class="backlink" data-action="go" data-view="${STATE.profile.name?'challenge-menu':'home'}">← 返回</button>
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap">
+      <div>
+        <span class="section-eyebrow">${icon('clipboard',16)} 考前模擬排行榜</span>
+        <h2 class="h-title">模擬考成績排行</h2>
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="mock-leaderboard-refresh">↻ 重新整理</button>
+    </div>
+    <div class="video-intro" style="margin-top:14px">
+      📝 這是<b>獨立於一般排行榜</b>的模擬考專用排名，只計算「考前模擬」模式的成績，且需達 <b>${MOCK_EXAM_MIN_SCORE} 分</b>以上才會列入（每次都是全題庫 ${MOCK_EXAM_QUESTION_COUNT} 題、限時 ${MOCK_EXAM_DURATION_SEC/60} 分鐘，條件完全一致，所以只依分數排序，同分再比用時）。
+    </div>
+    <div class="spacer-16"></div>
+    <div id="mockLbFilters"></div>
+    <div id="mockLbContent"><div class="loading"><span class="spin"></span>載入成績中…</div></div>
+  </div>`;
 }
 
 function viewLeaderboard(){
@@ -1355,8 +1491,8 @@ async function renderLeaderboardAsync(){
       </div>
     </div>`;
 
-  let filtered = subs.filter(s=> s.total >= MIN_LEADERBOARD_QUESTIONS);
-  const excludedCount = subs.length - filtered.length;
+  let filtered = subs.filter(s=> s.examType!=='mock' && s.total >= MIN_LEADERBOARD_QUESTIONS);
+  const excludedLowCount = subs.filter(s=> s.examType!=='mock' && s.total < MIN_LEADERBOARD_QUESTIONS).length;
   if(STATE.lbFilter!=='all') filtered = filtered.filter(s=>s.examCode===STATE.lbFilter);
   if(STATE.lbSearch.trim()) filtered = filtered.filter(s=> (s.name||'').includes(STATE.lbSearch.trim()) || (s.seat||'').includes(STATE.lbSearch.trim()));
 
@@ -1377,7 +1513,7 @@ async function renderLeaderboardAsync(){
   } else {
     const me = STATE.profile;
     contentEl.innerHTML = `
-    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedCount>0?` 另有 <b>${excludedCount}</b> 筆因未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻未列入。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedLowCount>0?` 另有 <b>${excludedLowCount}</b> 筆因未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻未列入。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
     <div class="tbl-wrap"><table><thead><tr>
       <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
@@ -1390,7 +1526,7 @@ async function renderLeaderboardAsync(){
         <td>${esc(s.name)}</td>
         <td>${esc(s.seat||'—')}</td>
         <td>${esc(s.cls||'—')}</td>
-        <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
+        <td>${submissionModeLabel(s)}</td>
         <td title="${esc(levelNames)}">${getPoolSize(s)}題</td>
         <td><b>${s.score}分</b></td>
         <td>${s.correct}/${s.total}</td>
@@ -1478,7 +1614,7 @@ async function renderTeacherAsync(forceRefresh=false){
     const sorted = subs.slice().sort((a,b)=>b.timestamp-a.timestamp);
     el.innerHTML = `
       <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
-      <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻，不會出現在排行榜上。</p>
+      <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
       <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV</button>
@@ -1490,11 +1626,12 @@ async function renderTeacherAsync(forceRefresh=false){
         <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
       </tr></thead><tbody>
       ${rows.slice(0,300).map(s=>{
-        const belowThreshold = s.total < MIN_LEADERBOARD_QUESTIONS;
+        const isMock = s.examType==='mock';
+        const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS);
         return `<tr${belowThreshold?' style="opacity:0.55"':''}>
         <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
-        <td>${s.mode==='group'?'團體 '+esc(s.examCode):'個人'}</td>
-        <td>${(s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
+        <td>${submissionModeLabel(s)}</td>
+        <td>${isMock ? '全題庫' : (s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
         <td><b>${s.score}</b></td><td>${s.correct}/${s.total}${belowThreshold?' ⚠️':''}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
       </tr>`;
       }).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
@@ -1588,6 +1725,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='confirm-exit-session'){
     const ok = await showConfirm('確定要離開嗎？本次作答進度將不會被記錄。');
     if(ok){
+      stopMockTimer();
       STATE.session=null; go(STATE.view.startsWith('challenge')?'challenge-menu':'home');
     }
   }
@@ -1644,6 +1782,13 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     STATE.cache.submissions = null;
     STATE.cache.examcodes = null;
     render();
+  }
+  else if(action==='mock-leaderboard-refresh'){
+    STATE.cache.submissions = null;
+    render();
+  }
+  else if(action==='start-mock-exam'){
+    startMockExamSession();
   }
   else if(action==='delete-examcode'){
     const ok = await showConfirm('確定要刪除這組考題代碼嗎？（已提交的成績不會被刪除）');
@@ -1726,6 +1871,66 @@ function startNewSession(mode){
   };
   go(mode==='practice' ? 'practice-session' : 'challenge-session');
 }
+function startMockExamSession(){
+  const pool = buildPool(new Set(MOCK_EXAM_ALL_LEVELS));
+  const n = Math.min(MOCK_EXAM_QUESTION_COUNT, pool.length);
+  const qids = sample(pool, n);
+  STATE.session = {
+    kind:'challenge', mode:'mock-exam', examType:'mock', examCode:null,
+    levels: MOCK_EXAM_ALL_LEVELS.slice(),
+    qids, idx:0, correctCount:0,
+    results:new Array(qids.length).fill(null),
+    answers:new Array(qids.length).fill(null),
+    answered:false, selectedOption:null,
+    startedAt: Date.now(),
+    endTime: Date.now() + MOCK_EXAM_DURATION_SEC*1000
+  };
+  startMockTimer();
+  go('challenge-session');
+}
+function stopMockTimer(){
+  if(STATE.mockTimerHandle){ clearInterval(STATE.mockTimerHandle); STATE.mockTimerHandle=null; }
+}
+function startMockTimer(){
+  stopMockTimer();
+  STATE.mockTimerHandle = setInterval(()=>{
+    const sess = STATE.session;
+    if(!sess || sess.examType!=='mock' || STATE.view!=='challenge-session'){ stopMockTimer(); return; }
+    const remainMs = sess.endTime - Date.now();
+    const el = document.getElementById('mockTimerDisplay');
+    if(remainMs<=0){
+      stopMockTimer();
+      forceFinishMockExam();
+      return;
+    }
+    if(el) el.innerHTML = mockTimerHtml(remainMs);
+  }, 1000);
+}
+function mockTimerHtml(remainMs){
+  const totalSec = Math.max(0, Math.ceil(remainMs/1000));
+  const m = Math.floor(totalSec/60), s = totalSec%60;
+  const low = totalSec <= 5*60;
+  return `<span class="mock-timer ${low?'low':''}">⏱ 剩餘時間 ${m}:${String(s).padStart(2,'0')}</span>`;
+}
+async function forceFinishMockExam(){
+  const sess = STATE.session;
+  if(!sess) return;
+  // Commit whatever the student had selected on the question they were currently
+  // viewing when time ran out — otherwise a correct-but-unsubmitted answer would be
+  // wrongly counted as wrong just because they never clicked "下一題".
+  if(sess.results[sess.idx]===null && sess.selectedOption!=null){
+    const qi = sess.qids[sess.idx];
+    sess.results[sess.idx] = QDATA[qi][6]===sess.selectedOption;
+    sess.answers[sess.idx] = sess.selectedOption;
+    if(sess.results[sess.idx]) sess.correctCount++;
+  }
+  // Any question left unanswered when time runs out counts as wrong, same as a real exam.
+  for(let i=0;i<sess.qids.length;i++){
+    if(sess.results[i]===null) sess.results[i] = false;
+  }
+  toast('時間到，已自動送出考卷');
+  await finishSession();
+}
 function startWrongBankSession(){
   const qids = shuffle(STATE.wrongBank.filter(w=>w.starred).map(w=>w.qi));
   if(qids.length===0){ toast('目前沒有已標記的錯題'); return; }
@@ -1778,13 +1983,14 @@ function advanceSession(){
 }
 async function finishSession(){
   const sess = STATE.session;
+  stopMockTimer();
   const durationSec = Math.round((Date.now()-sess.startedAt)/1000);
   const wrongQids = sess.qids.filter((qi,i)=>sess.results[i]===false);
   const total = sess.qids.length;
   const summary = {
     qids: sess.qids, results: sess.results, answers: sess.answers,
     correct: sess.correctCount, total, durationSec,
-    examCode: sess.examCode
+    examCode: sess.examCode, examType: sess.examType || null
   };
   STATE.lastSummary = summary;
 
@@ -1795,6 +2001,7 @@ async function finishSession(){
       id: uid(), name:p.name, seat:p.seat, cls:p.cls,
       mode: sess.examCode ? 'group' : 'individual',
       examCode: sess.examCode || null,
+      examType: sess.examType || null,
       levels: sess.levels, total, correct: sess.correctCount,
       score: Math.round(sess.correctCount/total*100),
       poolSize, wrongQids, durationSec, timestamp: Date.now()
