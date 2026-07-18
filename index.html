@@ -614,6 +614,40 @@ async function sList(prefix='', shared=false){
     return snap.docs.map(d=>d.id);
   }catch(e){ console.error('Firestore list failed', prefix, e); return []; }
 }
+
+/* ---------------- Snapshot infrastructure (scaling fix) ----------------
+   Reading the leaderboard / teacher stats used to mean scanning EVERY submission ever
+   stored — cost grew without bound as more students used the app, and would exhaust
+   Firebase's free daily read quota after only a few thousand accumulated submissions.
+   These helpers instead maintain small precomputed documents that get updated
+   incrementally (inside a Firestore transaction, so concurrent submitters can't clobber
+   each other) every time a challenge is submitted. Reading them back always costs a
+   small, constant number of reads, no matter how much history has piled up. */
+const LEADERBOARD_SNAPSHOT_CAP = 500;      // more than anyone realistically scrolls through
+const MOCK_LEADERBOARD_SNAPSHOT_CAP = 300;
+async function sTransactionUpdate(key, updateFn, shared=true){
+  if(!shared || !firebaseReady) return null;
+  try{
+    return await db.runTransaction(async (tx)=>{
+      const ref = db.collection('kv').doc(key);
+      const doc = await tx.get(ref);
+      const currentValue = doc.exists ? doc.data().value : null;
+      const nextValue = updateFn(currentValue);
+      tx.set(ref, { value: nextValue, updatedAt: Date.now() });
+      return nextValue;
+    });
+  }catch(e){ console.error('Firestore transaction failed', key, e); return null; }
+}
+/* Deterministic short hash so we can index each student's own submissions without
+   needing a Firestore composite index (student names/seats are free text and can't
+   safely be used as a raw key segment). Collisions just mean my-history does one extra
+   client-side filter pass on a tiny result set — never a correctness problem. */
+function studentKey(name, seat){
+  const s = String(name||'')+'|'+String(seat||'');
+  let h = 5381;
+  for(let i=0;i<s.length;i++){ h = ((h*33) ^ s.charCodeAt(i)) >>> 0; }
+  return h.toString(36);
+}
 async function getJSON(key, shared=false, fallback=null){
   const v = await sGet(key, shared);
   if(v===null) return fallback;
@@ -712,12 +746,19 @@ const STATE = {
   lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
   lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
   lbCustomLimit:'',
-  cache:{ submissions:null, examcodes:null },
+  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null },
   loading:false,
   importBusy:false,
   importError:null,
   mockTimerHandle:null,   // setInterval id for the live countdown, cleared on exit/finish
-  mockLbLimit:50
+  mockLbLimit:50,
+  teacherRecords:null,     // null = not yet loaded; [] = loaded, zero results
+  teacherRecordsLastKey:null,
+  teacherRecordsHasMore:false,
+  teacherRecordsLoading:false,
+  teacherLookupResult:null, // result of the exact-student lookup tool (records tab)
+  teacherLookupError:null,
+  rebuildBusy:false
 };
 
 async function loadPersonal(){
@@ -1210,21 +1251,33 @@ function viewCodeReady(){
 }
 
 /* ================= LEADERBOARD ================= */
-async function fetchAllSubmissions(force=false){
-  if(STATE.cache.submissions && !force) return STATE.cache.submissions;
+/* Full collection scan — expensive (cost grows with total accumulated history).
+   Used ONLY for: (a) CSV export, and (b) the one-time "重建排行榜快照" migration.
+   Everyday page loads (leaderboard, teacher overview/mistakes/codes, my-history) use
+   the cheap snapshot readers below instead — see recordIntoFastPaths() for how those
+   snapshots get kept up to date. */
+async function fetchAllSubmissionsFull(){
   const keys = await sList('submission:', true);
-  const sorted = keys.slice().sort().reverse(); // newest first (keys are timestamp-prefixed)
-  const limited = sorted.slice(0, 1000);
-  // Fetch every record in parallel instead of one-at-a-time — this is what made
-  // the leaderboard/teacher dashboard feel slow once there were dozens of entries.
-  // (Uses the exact same sGet()/sList() calls that were already confirmed working —
-  // only the sequencing changed, not the underlying Firestore query.)
-  const values = await Promise.all(limited.map(k => sGet(k, true)));
+  const sorted = keys.slice().sort().reverse();
+  const values = await Promise.all(sorted.map(k => sGet(k, true)));
   const results = [];
   for(const v of values){
     if(v){ try{ results.push(JSON.parse(v)); }catch(e){} }
   }
-  STATE.cache.submissions = results;
+  return results;
+}
+/* Same as above but keeps each record's original storage key alongside it — needed by
+   the snapshot-rebuild migration to regenerate the matching per-student mirror keys
+   (mysub:{studentKey}:{subId}), since that suffix isn't reconstructable from the
+   record's own fields alone (id and the key's random suffix are separate values). */
+async function fetchAllSubmissionsFullWithKeys(){
+  const keys = await sList('submission:', true);
+  const sorted = keys.slice().sort().reverse();
+  const values = await Promise.all(sorted.map(k => sGet(k, true)));
+  const results = [];
+  for(let i=0;i<sorted.length;i++){
+    if(values[i]){ try{ results.push({ key:sorted[i], record:JSON.parse(values[i]) }); }catch(e){} }
+  }
   return results;
 }
 async function fetchAllExamCodes(force=false){
@@ -1238,6 +1291,63 @@ async function fetchAllExamCodes(force=false){
   STATE.cache.examcodes = results;
   return results;
 }
+
+/* ---- Cheap read paths (constant cost, don't scale with total history) ---- */
+async function fetchLeaderboardSnapshot(force=false){
+  if(STATE.cache.lbSnapshot && !force) return STATE.cache.lbSnapshot;
+  const list = await getJSON('snapshot:leaderboard', true, []);
+  STATE.cache.lbSnapshot = Array.isArray(list) ? list : [];
+  return STATE.cache.lbSnapshot;
+}
+async function fetchMockLeaderboardSnapshot(force=false){
+  if(STATE.cache.mockLbSnapshot && !force) return STATE.cache.mockLbSnapshot;
+  const list = await getJSON('snapshot:mockleaderboard', true, []);
+  STATE.cache.mockLbSnapshot = Array.isArray(list) ? list : [];
+  return STATE.cache.mockLbSnapshot;
+}
+async function fetchTeacherStats(force=false){
+  if(STATE.cache.teacherStats && !force) return STATE.cache.teacherStats;
+  const stats = await getJSON('snapshot:teacherstats', true, null);
+  STATE.cache.teacherStats = stats || { totalSubmissions:0, totalScoreSum:0, byLevel:{}, wrongFreq:{}, uniqueStudents:{}, byExamCode:{} };
+  return STATE.cache.teacherStats;
+}
+async function fetchMyOwnSubmissions(name, seat){
+  const sk = studentKey(name, seat);
+  const keys = await sList('mysub:'+sk+':', true);
+  const values = await Promise.all(keys.map(k => sGet(k, true)));
+  const results = [];
+  for(const v of values){
+    if(v){ try{ const rec = JSON.parse(v); if(rec.name===name && rec.seat===seat) results.push(rec); }catch(e){} }
+  }
+  return results;
+}
+/* Bounded page of the newest N raw submissions, for the teacher "學生紀錄" tab. Costs
+   exactly `limit` reads no matter how large the full history has grown — the opposite
+   of fetchAllSubmissionsFull() above. Pass the last-seen key back in as `beforeKey` to
+   load the next older page ("載入更多"). */
+async function fetchRecentSubmissionsPage(limit=300, beforeKey=null){
+  if(!firebaseReady) return { records:[], lastKey:null, hasMore:false, error:true };
+  try{
+    let query = db.collection('kv')
+      .where(firebase.firestore.FieldPath.documentId(), '>=', 'submission:')
+      .where(firebase.firestore.FieldPath.documentId(), '<', 'submission;')
+      .orderBy(firebase.firestore.FieldPath.documentId(), 'desc')
+      .limit(limit);
+    if(beforeKey) query = query.startAfter(beforeKey);
+    const snap = await query.get();
+    const records = [];
+    let lastKey = null;
+    snap.docs.forEach(d=>{
+      lastKey = d.id;
+      try{ records.push(JSON.parse(d.data().value)); }catch(e){}
+    });
+    return { records, lastKey, hasMore: snap.docs.length===limit, error:false };
+  }catch(e){
+    console.error('Firestore paginated fetch failed', e);
+    return { records:[], lastKey:null, hasMore:false, error:true };
+  }
+}
+
 
 function getPoolSize(s){
   // Prefer the value captured at submission time; fall back to recomputing from the
@@ -1291,23 +1401,34 @@ function viewMyHistory(){
 }
 
 async function renderMyHistoryAsync(){
-  const subs = await fetchAllSubmissions();
+  if(STATE.view!=='my-history') return;
+  const p = STATE.profile;
+  // Yield to the microtask queue before touching the DOM: this function can be invoked
+  // synchronously from within viewMyHistory(), before render() has actually inserted
+  // the returned HTML (with #myHistoryContent) into the page. Without this await first,
+  // document.getElementById below can run too early and find nothing, silently leaving
+  // the "載入紀錄中…" placeholder stuck forever.
+  await Promise.resolve();
   if(STATE.view!=='my-history') return;
   const el = document.getElementById('myHistoryContent');
   if(!el) return;
-
-  const p = STATE.profile;
   if(!p.name || !p.seat){
     el.innerHTML = `<div class="empty-state">${ICONS.target}<p>請先到挑戰區輸入姓名與班級座號，才能查看個人紀錄。</p>
       <button class="btn btn-secondary btn-sm" data-action="go" data-view="challenge-entry">前往輸入</button></div>`;
     return;
   }
-  const mine = subs.filter(s=> s.name===p.name && s.seat===p.seat).sort((a,b)=>b.timestamp-a.timestamp);
+  // Reads only THIS student's own mirrored records (via the per-student key prefix),
+  // not the whole submissions history — cost stays tiny no matter how many other
+  // students have used the app.
+  const mine = (await fetchMyOwnSubmissions(p.name, p.seat)).sort((a,b)=>b.timestamp-a.timestamp);
+  if(STATE.view!=='my-history') return; // profile/view may have changed while awaiting
+  const el2 = document.getElementById('myHistoryContent');
+  if(!el2) return;
   if(mine.length===0){
-    el.innerHTML = `<div class="empty-state">${ICONS.target}<p>你還沒有任何挑戰紀錄，去挑戰區試試看吧！</p></div>`;
+    el2.innerHTML = `<div class="empty-state">${ICONS.target}<p>你還沒有任何挑戰紀錄，去挑戰區試試看吧！</p></div>`;
     return;
   }
-  el.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
+  el2.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
     <th>時間</th><th>模式</th><th>級別</th><th>分數</th><th>練習題數</th><th>用時</th><th>是否列入排行榜</th>
   </tr></thead><tbody>
   ${mine.map(s=>{
@@ -1354,7 +1475,7 @@ function viewMockExamIntro(){
 }
 
 async function renderMockLeaderboardAsync(){
-  const subs = await fetchAllSubmissions();
+  const subs = await fetchMockLeaderboardSnapshot();
   if(STATE.view!=='mock-leaderboard') return;
   const el = document.getElementById('mockLbContent');
   const filterEl = document.getElementById('mockLbFilters');
@@ -1370,7 +1491,7 @@ async function renderMockLeaderboardAsync(){
       </select>
     </div>`;
 
-  const mockSubs = subs.filter(s=> s.examType==='mock' && s.score >= MOCK_EXAM_MIN_SCORE);
+  const mockSubs = subs.slice();
   mockSubs.sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
   const limitN = STATE.mockLbLimit==='all' ? Infinity : parseInt(STATE.mockLbLimit);
   const shown = mockSubs.slice(0, limitN);
@@ -1438,7 +1559,7 @@ function viewLeaderboard(){
     </div>
     <div class="video-intro" style="margin-top:14px">
       📊 <b>排序原則：</b>預設採「綜合排名」，依序比較<b>題庫量（挑戰的級別/影片單元涵蓋越多題庫越優先）→ 分數 → 練習題數 → 用時</b>，避免只選少數簡單題庫就衝上第一名。也可以在下面切換排序依據，單獨看某一項目的排名。<br>
-      🛡️ <b>入榜門檻：</b>單次挑戰需作答滿 <b>${MIN_LEADERBOARD_QUESTIONS} 題</b>才會列入排行榜，避免用極少題數刷出無意義的高分；未達門檻的成績仍會保留，可在「我的挑戰紀錄」查看。
+      🛡️ <b>入榜門檻：</b>單次挑戰需作答滿 <b>${MIN_LEADERBOARD_QUESTIONS} 題</b>才會列入排行榜，避免用極少題數刷出無意義的高分；未達門檻的成績仍會保留，可在「我的挑戰紀錄」查看。榜單保留綜合排名前 <b>${LEADERBOARD_SNAPSHOT_CAP}</b> 名。
     </div>
     <div class="spacer-16"></div>
     <div id="lbFilters"></div>
@@ -1447,7 +1568,7 @@ function viewLeaderboard(){
 }
 
 async function renderLeaderboardAsync(){
-  const subs = await fetchAllSubmissions();
+  const subs = await fetchLeaderboardSnapshot();
   const codes = await fetchAllExamCodes();
   if(STATE.view!=='leaderboard') return;
 
@@ -1491,8 +1612,7 @@ async function renderLeaderboardAsync(){
       </div>
     </div>`;
 
-  let filtered = subs.filter(s=> s.examType!=='mock' && s.total >= MIN_LEADERBOARD_QUESTIONS);
-  const excludedLowCount = subs.filter(s=> s.examType!=='mock' && s.total < MIN_LEADERBOARD_QUESTIONS).length;
+  let filtered = subs;
   if(STATE.lbFilter!=='all') filtered = filtered.filter(s=>s.examCode===STATE.lbFilter);
   if(STATE.lbSearch.trim()) filtered = filtered.filter(s=> (s.name||'').includes(STATE.lbSearch.trim()) || (s.seat||'').includes(STATE.lbSearch.trim()));
 
@@ -1513,7 +1633,7 @@ async function renderLeaderboardAsync(){
   } else {
     const me = STATE.profile;
     contentEl.innerHTML = `
-    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedLowCount>0?` 另有 <b>${excludedLowCount}</b> 筆因未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻未列入。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
     <div class="tbl-wrap"><table><thead><tr>
       <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
@@ -1583,66 +1703,114 @@ function viewTeacherDashboard(){
   </div>`;
 }
 
+async function loadTeacherRecordsPage(reset){
+  if(STATE.teacherRecordsLoading) return;
+  STATE.teacherRecordsLoading = true;
+  if(reset){ STATE.teacherRecords=[]; STATE.teacherRecordsLastKey=null; STATE.teacherRecordsHasMore=false; }
+  const { records, lastKey, hasMore } = await fetchRecentSubmissionsPage(300, reset?null:STATE.teacherRecordsLastKey);
+  STATE.teacherRecords = (STATE.teacherRecords||[]).concat(records);
+  STATE.teacherRecordsLastKey = lastKey;
+  STATE.teacherRecordsHasMore = hasMore;
+  STATE.teacherRecordsLoading = false;
+}
+
+function teacherRecordRowHtml(s){
+  const isMock = s.examType==='mock';
+  const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS);
+  return `<tr${belowThreshold?' style="opacity:0.55"':''}>
+    <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
+    <td>${submissionModeLabel(s)}</td>
+    <td>${isMock ? '全題庫' : (s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
+    <td><b>${s.score}</b></td><td>${s.correct}/${s.total}${belowThreshold?' ⚠️':''}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
+  </tr>`;
+}
+
 async function renderTeacherAsync(forceRefresh=false){
-  const subs = await fetchAllSubmissions(forceRefresh);
+  if(forceRefresh){
+    STATE.cache.teacherStats = null;
+    STATE.cache.examcodes = null;
+    STATE.teacherRecords = null;
+  }
   const codes = await fetchAllExamCodes(forceRefresh);
   if(STATE.view!=='teacher-dashboard') return;
   const el = document.getElementById('teacherContent');
   if(!el) return;
 
   if(STATE.teacherTab==='overview'){
-    const avg = subs.length ? Math.round(subs.reduce((a,s)=>a+s.score,0)/subs.length) : 0;
-    const byLevel = {};
-    subs.forEach(s=>{ (s.levels||[]).forEach(lv=>{ byLevel[lv]=byLevel[lv]||{c:0,t:0}; byLevel[lv].c+=s.correct; byLevel[lv].t+=s.total; }); });
+    const stats = await fetchTeacherStats(forceRefresh);
+    if(STATE.view!=='teacher-dashboard') return;
+    const avg = stats.totalSubmissions ? Math.round(stats.totalScoreSum/stats.totalSubmissions) : 0;
     el.innerHTML = `
       <div class="stat-grid">
-        <div class="stat-tile"><div class="num">${subs.length}</div><div class="lbl">總作答人次</div></div>
+        <div class="stat-tile"><div class="num">${stats.totalSubmissions||0}</div><div class="lbl">總作答人次</div></div>
         <div class="stat-tile"><div class="num">${avg}</div><div class="lbl">平均分數</div></div>
         <div class="stat-tile"><div class="num">${codes.length}</div><div class="lbl">建立的考題代碼</div></div>
-        <div class="stat-tile"><div class="num">${new Set(subs.map(s=>s.name+s.seat)).size}</div><div class="lbl">參與學生人數</div></div>
+        <div class="stat-tile"><div class="num">${Object.keys(stats.uniqueStudents||{}).length}</div><div class="lbl">參與學生人數</div></div>
       </div>
       <h3 style="font-family:var(--font-display);font-size:1rem;margin-bottom:10px">各級別／影片單元平均正確率</h3>
       <div class="tbl-wrap"><table><thead><tr><th>級別</th><th>作答題數</th><th>正確率</th></tr></thead><tbody>
       ${LEVELS.map(l=>{
-        const d = byLevel[l.key]||{c:0,t:0};
+        const d = (stats.byLevel||{})[l.key]||{c:0,t:0};
         const pct = d.t? Math.round(d.c/d.t*100):0;
         return `<tr><td>${l.name}</td><td>${d.t}</td><td>${pct}%</td></tr>`;
       }).join('')}
       </tbody></table></div>`;
   }
   else if(STATE.teacherTab==='records'){
-    const sorted = subs.slice().sort((a,b)=>b.timestamp-a.timestamp);
+    if(STATE.teacherRecords===null){
+      await loadTeacherRecordsPage(true);
+      if(STATE.view!=='teacher-dashboard') return;
+    }
     el.innerHTML = `
-      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
+      <p class="hint" style="margin-bottom:10px">📄 這裡預設顯示<b>最新 ${STATE.teacherRecords.length} 筆</b>紀錄，搜尋只會在已載入的資料中查找。若要找更早、還沒載入的紀錄，請往下按「載入更早的紀錄」，或用下方「查詢單一學生完整紀錄」直接查特定人。</p>
+      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="在已載入資料中搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
       <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
-      <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV</button>
+      <div class="btnrow">
+        ${STATE.teacherRecordsHasMore ? `<button class="btn btn-ghost btn-sm" data-action="load-more-teacher-records">${STATE.teacherRecordsLoading?'載入中…':'載入更早的紀錄'}</button>` : `<span class="hint">已載入所有紀錄</span>`}
+        <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV（含未載入的舊資料）</button>
+      </div>
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--cream-100)">
+        <b>🔍 查詢單一學生完整紀錄</b>
+        <p class="hint" style="margin:6px 0 12px">直接輸入姓名和班級座號（需完全一致），查出這位學生的所有歷史紀錄，不受上面分頁限制。</p>
+        <div class="field-row">
+          <div class="field"><input type="text" id="teacherLookupName" placeholder="姓名，例如：王小明"></div>
+          <div class="field"><input type="text" id="teacherLookupSeat" placeholder="班級座號，例如：503 02"></div>
+        </div>
+        <button class="btn btn-secondary btn-sm" data-action="teacher-lookup-student">查詢</button>
+        <div id="teacherLookupResult" class="spacer-16"></div>
+      </div>
     `;
     const draw = ()=>{
       const q = (document.getElementById('teacherSearch').value||'').trim();
-      const rows = q ? sorted.filter(s=>(s.name||'').includes(q)||(s.seat||'').includes(q)||(s.examCode||'').includes(q)||(s.cls||'').includes(q)) : sorted;
+      const rows = q ? STATE.teacherRecords.filter(s=>(s.name||'').includes(q)||(s.seat||'').includes(q)||(s.examCode||'').includes(q)||(s.cls||'').includes(q)) : STATE.teacherRecords;
       document.getElementById('teacherRecordsTbl').innerHTML = `<div class="tbl-wrap"><table><thead><tr>
         <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
       </tr></thead><tbody>
-      ${rows.slice(0,300).map(s=>{
-        const isMock = s.examType==='mock';
-        const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS);
-        return `<tr${belowThreshold?' style="opacity:0.55"':''}>
-        <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
-        <td>${submissionModeLabel(s)}</td>
-        <td>${isMock ? '全題庫' : (s.levels||[]).map(k=>levelInfo(k).name).join('、')}</td>
-        <td><b>${s.score}</b></td><td>${s.correct}/${s.total}${belowThreshold?' ⚠️':''}</td><td>${s.durationSec!=null?fmtDuration(s.durationSec):'—'}</td>
-      </tr>`;
-      }).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
+      ${rows.map(teacherRecordRowHtml).join('') || '<tr><td colspan="9" class="muted">沒有符合的紀錄</td></tr>'}
       </tbody></table></div>`;
     };
     draw();
     document.getElementById('teacherSearch').oninput = draw;
+    if(STATE.teacherLookupResult || STATE.teacherLookupError){
+      const box = document.getElementById('teacherLookupResult');
+      if(STATE.teacherLookupError){
+        box.innerHTML = `<div class="errmsg">${esc(STATE.teacherLookupError)}</div>`;
+      } else if(STATE.teacherLookupResult.length===0){
+        box.innerHTML = `<p class="muted">查無紀錄，請確認姓名和班級座號是否完全正確（含空格）。</p>`;
+      } else {
+        box.innerHTML = `<div class="tbl-wrap"><table><thead><tr>
+          <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
+        </tr></thead><tbody>${STATE.teacherLookupResult.slice().sort((a,b)=>b.timestamp-a.timestamp).map(teacherRecordRowHtml).join('')}</tbody></table></div>`;
+      }
+    }
   }
   else if(STATE.teacherTab==='mistakes'){
-    const freq = {};
-    subs.forEach(s=>{ (s.wrongQids||[]).forEach(qi=>{ freq[qi]=(freq[qi]||0)+1; }); });
+    const stats = await fetchTeacherStats(forceRefresh);
+    if(STATE.view!=='teacher-dashboard') return;
+    const freq = stats.wrongFreq || {};
     const top = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,30);
     el.innerHTML = top.length===0 ? `<div class="empty-state">${ICONS.leaf}<p>目前還沒有足夠的錯題資料。</p></div>` : `
       <p class="h-sub" style="margin-bottom:14px">全班最常答錯的題目，適合安排課堂複習：</p>
@@ -1651,10 +1819,12 @@ async function renderTeacherAsync(forceRefresh=false){
       </tbody></table></div>`;
   }
   else if(STATE.teacherTab==='codes'){
+    const stats = await fetchTeacherStats(forceRefresh);
+    if(STATE.view!=='teacher-dashboard') return;
     el.innerHTML = codes.length===0 ? `<div class="empty-state">${ICONS.users}<p>尚未建立任何考題代碼。</p></div>` : `
       <div class="tbl-wrap"><table><thead><tr><th>代碼</th><th>級別</th><th>題數</th><th>建立者</th><th>建立時間</th><th>參與人次</th><th></th></tr></thead><tbody>
       ${codes.slice().sort((a,b)=>b.createdAt-a.createdAt).map(c=>{
-        const n = subs.filter(s=>s.examCode===c.code).length;
+        const n = (stats.byExamCode||{})[c.code] || 0;
         return `<tr><td><b>${esc(c.code)}</b></td><td>${c.levels.map(k=>levelInfo(k).name).join('、')}</td><td>${c.qids.length}</td><td>${esc(c.creator||'—')}</td><td>${fmtTime(c.createdAt)}</td><td>${n}</td>
         <td><button class="btn btn-ghost btn-sm" data-action="delete-examcode" data-code="${esc(c.code)}">刪除</button></td></tr>`;
       }).join('')}
@@ -1672,6 +1842,14 @@ async function renderTeacherAsync(forceRefresh=false){
         <b>題庫管理</b>
         <p class="hint" style="margin:6px 0 12px">目前題庫共 <b>${QDATA.length}</b> 題。若題庫有更新，可重新上傳 JSON 檔案覆蓋。</p>
         <button class="btn btn-secondary btn-sm" data-action="reimport-qdata">重新匯入題庫</button>
+      </div>
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--leaf-100); border-color:var(--leaf-300)">
+        <b>🔧 重建排行榜快照</b>
+        <p class="hint" style="margin:6px 0 12px">排行榜、模擬考排行榜、總覽統計都是讀取「快照」資料以加快速度，正常情況下每次交卷都會自動更新，不需要手動處理。
+        但如果懷疑快照跟實際紀錄對不上（例如曾經手動改過資料、或曾經看到快照更新失敗的錯誤），可以在這裡重新掃描<b>全部</b>歷史紀錄、重建快照。
+        資料量大時這個動作會比較久，且會消耗較多讀取額度，建議只在真的需要時使用，不要每天執行。</p>
+        <button class="btn btn-secondary btn-sm" data-action="rebuild-snapshots" ${STATE.rebuildBusy?'disabled':''}>${STATE.rebuildBusy?'重建中，請稍候…':'重建排行榜快照'}</button>
       </div>
       <div class="spacer-24"></div>
       <div class="card" style="background:var(--coral-100); border-color:#f0b8a9">
@@ -1774,17 +1952,43 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     render();
   }
   else if(action==='teacher-refresh'){
-    STATE.cache.submissions = null;
     STATE.cache.examcodes = null;
+    STATE.cache.teacherStats = null;
+    STATE.teacherRecords = null;
+    STATE.teacherLookupResult = null;
+    STATE.teacherLookupError = null;
     render();
   }
+  else if(action==='load-more-teacher-records'){
+    if(STATE.teacherRecordsLoading) return;
+    await loadTeacherRecordsPage(false);
+    render();
+  }
+  else if(action==='teacher-lookup-student'){
+    const name = (document.getElementById('teacherLookupName').value||'').trim();
+    const seat = (document.getElementById('teacherLookupSeat').value||'').trim();
+    if(!name || !seat){
+      STATE.teacherLookupError = '請輸入姓名和班級座號才能查詢。';
+      STATE.teacherLookupResult = null;
+      render();
+      return;
+    }
+    STATE.teacherLookupError = null;
+    const results = await fetchMyOwnSubmissions(name, seat);
+    STATE.teacherLookupResult = results;
+    render();
+  }
+  else if(action==='rebuild-snapshots'){
+    const ok = await showConfirm('這會重新掃描全部歷史紀錄來重建排行榜快照，資料量大時可能需要一些時間、並消耗較多讀取額度。確定要繼續嗎？');
+    if(ok){ await rebuildSnapshots(); }
+  }
   else if(action==='leaderboard-refresh'){
-    STATE.cache.submissions = null;
+    STATE.cache.lbSnapshot = null;
     STATE.cache.examcodes = null;
     render();
   }
   else if(action==='mock-leaderboard-refresh'){
-    STATE.cache.submissions = null;
+    STATE.cache.mockLbSnapshot = null;
     render();
   }
   else if(action==='start-mock-exam'){
@@ -1799,13 +2003,32 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     }
   }
   else if(action==='clear-all-submissions'){
-    const ok1 = await showConfirm('這將永久刪除所有學生作答紀錄，確定要繼續嗎？', true);
+    const ok1 = await showConfirm('這將永久刪除所有學生作答紀錄（含排行榜快照與個人紀錄），確定要繼續嗎？', true);
     if(!ok1) return;
     const ok2 = await showConfirm('請再次確認：真的要清除所有紀錄嗎？此動作無法復原。', true);
     if(!ok2) return;
-    const keys = await sList('submission:', true);
-    for(const k of keys){ await sDel(k, true); }
-    STATE.cache.submissions=null;
+    toast('正在清除所有紀錄，資料量大時請稍候…');
+    const subKeys = await sList('submission:', true);
+    const mirrorKeys = await sList('mysub:', true);
+    const allKeys = subKeys.concat(mirrorKeys);
+    const BATCH_SIZE = 450;
+    for(let i=0;i<allKeys.length;i+=BATCH_SIZE){
+      const chunk = allKeys.slice(i, i+BATCH_SIZE);
+      if(firebaseReady){
+        const batch = db.batch();
+        chunk.forEach(k=>batch.delete(db.collection('kv').doc(k)));
+        await batch.commit();
+      }
+    }
+    const emptyStats = { totalSubmissions:0, totalScoreSum:0, byLevel:{}, wrongFreq:{}, uniqueStudents:{}, byExamCode:{} };
+    await sSet('snapshot:leaderboard', JSON.stringify([]), true);
+    await sSet('snapshot:mockleaderboard', JSON.stringify([]), true);
+    await sSet('snapshot:teacherstats', JSON.stringify(emptyStats), true);
+    STATE.cache.lbSnapshot = null;
+    STATE.cache.mockLbSnapshot = null;
+    STATE.cache.teacherStats = null;
+    STATE.teacherRecords = null;
+    STATE.teacherLookupResult = null;
     toast('已清除所有作答紀錄');
     renderTeacherAsync();
   }
@@ -2006,12 +2229,140 @@ async function finishSession(){
       score: Math.round(sess.correctCount/total*100),
       poolSize, wrongQids, durationSec, timestamp: Date.now()
     };
-    await sSet('submission:'+Date.now()+'_'+uid(), JSON.stringify(record), true);
-    STATE.cache.submissions = null;
+    const subKey = 'submission:'+Date.now()+'_'+uid();
+    await sSet(subKey, JSON.stringify(record), true);
+    STATE.cache.lbSnapshot = null;
+    STATE.cache.mockLbSnapshot = null;
+    STATE.cache.teacherStats = null;
+
+    // Fire-and-forget the cheap-read-path maintenance writes. These must never block
+    // or fail the student's result screen — the raw submission above is already safely
+    // stored either way, and a teacher can always run "重建排行榜快照" later to catch
+    // up if one of these background writes happens to fail.
+    recordIntoFastPaths(record, subKey).catch(e=>console.error('fast-path update failed', e));
+
     go('challenge-summary');
   } else {
     go('practice-summary');
   }
+}
+
+/* One-time (or occasional) maintenance action: rescans every raw submission ever
+   stored and rebuilds the three snapshot documents plus every per-student mirror
+   from scratch. This is the expensive full-scan path, deliberately — but it only
+   runs when a teacher explicitly clicks the button, never on a normal page load, so
+   it doesn't reintroduce the scaling problem it exists to recover from. Needed for:
+   (a) backfilling data written before this snapshot system existed, and
+   (b) recovering if a fire-and-forget recordIntoFastPaths() call ever failed. */
+async function rebuildSnapshots(){
+  if(!firebaseReady){ toast('Firestore 尚未設定，無法重建'); return; }
+  STATE.rebuildBusy = true;
+  render();
+  try{
+    const withKeys = await fetchAllSubmissionsFullWithKeys();
+    const all = withKeys.map(x=>x.record);
+    toast(`已讀取 ${all.length} 筆歷史紀錄，開始重建…`);
+
+    const lbList = all.filter(s=> s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS);
+    lbList.sort((a,b)=>compareSubmissions(a,b,'combined'));
+    await sSet('snapshot:leaderboard', JSON.stringify(lbList.slice(0,LEADERBOARD_SNAPSHOT_CAP)), true);
+
+    const mockList = all.filter(s=> s.examType==='mock' && s.score>=MOCK_EXAM_MIN_SCORE);
+    mockList.sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
+    await sSet('snapshot:mockleaderboard', JSON.stringify(mockList.slice(0,MOCK_LEADERBOARD_SNAPSHOT_CAP)), true);
+
+    const stats = { totalSubmissions:0, totalScoreSum:0, byLevel:{}, wrongFreq:{}, uniqueStudents:{}, byExamCode:{} };
+    all.forEach(record=>{
+      stats.totalSubmissions++;
+      stats.totalScoreSum += record.score;
+      (record.levels||[]).forEach(lv=>{
+        stats.byLevel[lv] = stats.byLevel[lv] || {c:0,t:0};
+        stats.byLevel[lv].c += record.correct;
+        stats.byLevel[lv].t += record.total;
+      });
+      (record.wrongQids||[]).forEach(qi=>{ stats.wrongFreq[qi]=(stats.wrongFreq[qi]||0)+1; });
+      stats.uniqueStudents[studentKey(record.name, record.seat)] = true;
+      if(record.examCode) stats.byExamCode[record.examCode] = (stats.byExamCode[record.examCode]||0)+1;
+    });
+    await sSet('snapshot:teacherstats', JSON.stringify(stats), true);
+
+    // Per-student mirrors, batched (Firestore caps a single batch at 500 writes).
+    const BATCH_SIZE = 450;
+    for(let i=0;i<withKeys.length;i+=BATCH_SIZE){
+      const chunk = withKeys.slice(i, i+BATCH_SIZE);
+      const batch = db.batch();
+      chunk.forEach(({key, record})=>{
+        const sk = studentKey(record.name, record.seat);
+        const mirrorKey = 'mysub:'+sk+':'+key.slice('submission:'.length);
+        batch.set(db.collection('kv').doc(mirrorKey), { value: JSON.stringify(record), updatedAt: Date.now() });
+      });
+      await batch.commit();
+    }
+
+    STATE.cache.lbSnapshot = null;
+    STATE.cache.mockLbSnapshot = null;
+    STATE.cache.teacherStats = null;
+    toast(`重建完成！共處理 ${all.length} 筆紀錄。`);
+  }catch(e){
+    console.error('rebuildSnapshots failed', e);
+    toast('重建失敗，請查看瀏覽器主控台錯誤訊息，或稍後再試一次。');
+  }finally{
+    STATE.rebuildBusy = false;
+    render();
+  }
+}
+
+async function recordIntoFastPaths(record, subKey){
+  // 1) Per-student mirror so "我的挑戰紀錄" can query just this student's own rows
+  //    instead of scanning every submission ever made.
+  const sk = studentKey(record.name, record.seat);
+  await sSet('mysub:'+sk+':'+subKey.slice('submission:'.length), JSON.stringify(record), true);
+
+  // 2) Leaderboard snapshot(s) — only touch the one this submission actually qualifies
+  //    for, since updating a snapshot it would never appear on is wasted work.
+  if(record.examType==='mock'){
+    if(record.score >= MOCK_EXAM_MIN_SCORE){
+      await sTransactionUpdate('snapshot:mockleaderboard', (currentJson)=>{
+        let list = [];
+        if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
+        list.push(record);
+        list.sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
+        if(list.length > MOCK_LEADERBOARD_SNAPSHOT_CAP) list.length = MOCK_LEADERBOARD_SNAPSHOT_CAP;
+        return JSON.stringify(list);
+      });
+    }
+  } else if(record.total >= MIN_LEADERBOARD_QUESTIONS){
+    await sTransactionUpdate('snapshot:leaderboard', (currentJson)=>{
+      let list = [];
+      if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
+      list.push(record);
+      list.sort((a,b)=>compareSubmissions(a,b,'combined'));
+      if(list.length > LEADERBOARD_SNAPSHOT_CAP) list.length = LEADERBOARD_SNAPSHOT_CAP;
+      return JSON.stringify(list);
+    });
+  }
+
+  // 3) Teacher aggregate stats — every submission counts here regardless of leaderboard
+  //    eligibility, since the teacher dashboard needs to see everything.
+  await sTransactionUpdate('snapshot:teacherstats', (currentJson)=>{
+    let stats = { totalSubmissions:0, totalScoreSum:0, byLevel:{}, wrongFreq:{}, uniqueStudents:{}, byExamCode:{} };
+    if(currentJson){ try{ stats = Object.assign(stats, JSON.parse(currentJson)||{}); }catch(e){} }
+    stats.totalSubmissions = (stats.totalSubmissions||0) + 1;
+    stats.totalScoreSum = (stats.totalScoreSum||0) + record.score;
+    (record.levels||[]).forEach(lv=>{
+      stats.byLevel[lv] = stats.byLevel[lv] || {c:0,t:0};
+      stats.byLevel[lv].c += record.correct;
+      stats.byLevel[lv].t += record.total;
+    });
+    (record.wrongQids||[]).forEach(qi=>{
+      stats.wrongFreq[qi] = (stats.wrongFreq[qi]||0) + 1;
+    });
+    stats.uniqueStudents[studentKey(record.name, record.seat)] = true;
+    if(record.examCode){
+      stats.byExamCode[record.examCode] = (stats.byExamCode[record.examCode]||0) + 1;
+    }
+    return JSON.stringify(stats);
+  });
 }
 
 async function createGroupCode(){
@@ -2071,7 +2422,8 @@ async function teacherLoginSubmit(){
 }
 
 async function copyRecordsCsv(){
-  const subs = await fetchAllSubmissions();
+  toast('正在讀取全部歷史紀錄，資料量大時可能需要幾秒鐘…');
+  const subs = await fetchAllSubmissionsFull();
   const header = ['時間','姓名','學校','班級座號','模式','考題代碼','級別','分數','正確題數','總題數','用時(秒)'];
   const lines = [header.join(',')];
   subs.slice().sort((a,b)=>b.timestamp-a.timestamp).forEach(s=>{
