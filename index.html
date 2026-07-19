@@ -625,6 +625,7 @@ async function sList(prefix='', shared=false){
    small, constant number of reads, no matter how much history has piled up. */
 const LEADERBOARD_SNAPSHOT_CAP = 500;      // more than anyone realistically scrolls through
 const MOCK_LEADERBOARD_SNAPSHOT_CAP = 300;
+const RECENT_RECORDS_CAP = 3000;           // teacher "學生紀錄" tab — unfiltered, rolling window
 async function sTransactionUpdate(key, updateFn, shared=true){
   if(!shared || !firebaseReady) return null;
   try{
@@ -746,16 +747,12 @@ const STATE = {
   lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
   lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
   lbCustomLimit:'',
-  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null },
+  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null },
   loading:false,
   importBusy:false,
   importError:null,
   mockTimerHandle:null,   // setInterval id for the live countdown, cleared on exit/finish
   mockLbLimit:50,
-  teacherRecords:null,     // null = not yet loaded; [] = loaded, zero results
-  teacherRecordsLastKey:null,
-  teacherRecordsHasMore:false,
-  teacherRecordsLoading:false,
   teacherLookupResult:null, // result of the exact-student lookup tool (records tab)
   teacherLookupError:null,
   rebuildBusy:false
@@ -1311,6 +1308,19 @@ async function fetchTeacherStats(force=false){
   STATE.cache.teacherStats = stats || { totalSubmissions:0, totalScoreSum:0, byLevel:{}, wrongFreq:{}, uniqueStudents:{}, byExamCode:{} };
   return STATE.cache.teacherStats;
 }
+/* Unfiltered (not just leaderboard-eligible) recent-activity feed for the teacher
+   "學生紀錄" tab — same cheap single-document-read pattern as the leaderboard
+   snapshots above, just without the eligibility filter, so a teacher can see
+   everything including sub-threshold attempts. Rolling window of the most recent
+   RECENT_RECORDS_CAP submissions; anything older that scrolls off is still fully
+   reachable via "查詢單一學生完整紀錄", which reads the per-student mirror directly
+   and isn't affected by this cap. */
+async function fetchRecentRecordsSnapshot(force=false){
+  if(STATE.cache.recentRecords && !force) return STATE.cache.recentRecords;
+  const list = await getJSON('snapshot:recentrecords', true, []);
+  STATE.cache.recentRecords = Array.isArray(list) ? list : [];
+  return STATE.cache.recentRecords;
+}
 async function fetchMyOwnSubmissions(name, seat){
   const sk = studentKey(name, seat);
   const keys = await sList('mysub:'+sk+':', true);
@@ -1325,30 +1335,6 @@ async function fetchMyOwnSubmissions(name, seat){
    exactly `limit` reads no matter how large the full history has grown — the opposite
    of fetchAllSubmissionsFull() above. Pass the last-seen key back in as `beforeKey` to
    load the next older page ("載入更多"). */
-async function fetchRecentSubmissionsPage(limit=300, beforeKey=null){
-  if(!firebaseReady) return { records:[], lastKey:null, hasMore:false, error:true };
-  try{
-    let query = db.collection('kv')
-      .where(firebase.firestore.FieldPath.documentId(), '>=', 'submission:')
-      .where(firebase.firestore.FieldPath.documentId(), '<', 'submission;')
-      .orderBy(firebase.firestore.FieldPath.documentId(), 'desc')
-      .limit(limit);
-    if(beforeKey) query = query.startAfter(beforeKey);
-    const snap = await query.get();
-    const records = [];
-    let lastKey = null;
-    snap.docs.forEach(d=>{
-      lastKey = d.id;
-      try{ records.push(JSON.parse(d.data().value)); }catch(e){}
-    });
-    return { records, lastKey, hasMore: snap.docs.length===limit, error:false };
-  }catch(e){
-    console.error('Firestore paginated fetch failed', e);
-    return { records:[], lastKey:null, hasMore:false, error:true };
-  }
-}
-
-
 function getPoolSize(s){
   // Prefer the value captured at submission time; fall back to recomputing from the
   // stored level list for older records saved before poolSize was tracked.
@@ -1570,6 +1556,7 @@ function viewLeaderboard(){
 async function renderLeaderboardAsync(){
   const subs = await fetchLeaderboardSnapshot();
   const codes = await fetchAllExamCodes();
+  const stats = await fetchTeacherStats();
   if(STATE.view!=='leaderboard') return;
 
   const filterEl = document.getElementById('lbFilters');
@@ -1632,8 +1619,9 @@ async function renderLeaderboardAsync(){
     contentEl.innerHTML = `<div class="empty-state">${ICONS.trophy}<p>目前還沒有符合條件的挑戰紀錄。</p>${STATE.profile.name?`<button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history">查看我的挑戰紀錄</button>`:''}</div>`;
   } else {
     const me = STATE.profile;
+    const excludedCount = Math.max(0, (stats.totalSubmissions||0) - subs.length);
     contentEl.innerHTML = `
-    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedCount>0?` 另外還有 <b>${excludedCount}</b> 筆挑戰紀錄因未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻（或為模擬考成績）未列入這份排行榜，可到教師後台「學生紀錄」或自己的「我的挑戰紀錄」查看。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
     <div class="tbl-wrap"><table><thead><tr>
       <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
@@ -1703,17 +1691,6 @@ function viewTeacherDashboard(){
   </div>`;
 }
 
-async function loadTeacherRecordsPage(reset){
-  if(STATE.teacherRecordsLoading) return;
-  STATE.teacherRecordsLoading = true;
-  if(reset){ STATE.teacherRecords=[]; STATE.teacherRecordsLastKey=null; STATE.teacherRecordsHasMore=false; }
-  const { records, lastKey, hasMore } = await fetchRecentSubmissionsPage(300, reset?null:STATE.teacherRecordsLastKey);
-  STATE.teacherRecords = (STATE.teacherRecords||[]).concat(records);
-  STATE.teacherRecordsLastKey = lastKey;
-  STATE.teacherRecordsHasMore = hasMore;
-  STATE.teacherRecordsLoading = false;
-}
-
 function teacherRecordRowHtml(s){
   const isMock = s.examType==='mock';
   const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS);
@@ -1729,7 +1706,7 @@ async function renderTeacherAsync(forceRefresh=false){
   if(forceRefresh){
     STATE.cache.teacherStats = null;
     STATE.cache.examcodes = null;
-    STATE.teacherRecords = null;
+    STATE.cache.recentRecords = null;
   }
   const codes = await fetchAllExamCodes(forceRefresh);
   if(STATE.view!=='teacher-dashboard') return;
@@ -1757,24 +1734,22 @@ async function renderTeacherAsync(forceRefresh=false){
       </tbody></table></div>`;
   }
   else if(STATE.teacherTab==='records'){
-    if(STATE.teacherRecords===null){
-      await loadTeacherRecordsPage(true);
-      if(STATE.view!=='teacher-dashboard') return;
-    }
+    const [recent, stats] = await Promise.all([fetchRecentRecordsSnapshot(forceRefresh), fetchTeacherStats(forceRefresh)]);
+    if(STATE.view!=='teacher-dashboard') return;
+    const cappedNote = (stats.totalSubmissions||0) > recent.length
+      ? `這裡顯示最新 <b>${recent.length}</b> 筆（全部共 <b>${stats.totalSubmissions}</b> 筆）。`
+      : `這裡顯示全部 <b>${recent.length}</b> 筆紀錄。`;
     el.innerHTML = `
-      <p class="hint" style="margin-bottom:10px">📄 這裡預設顯示<b>最新 ${STATE.teacherRecords.length} 筆</b>紀錄，搜尋只會在已載入的資料中查找。若要找更早、還沒載入的紀錄，請往下按「載入更早的紀錄」，或用下方「查詢單一學生完整紀錄」直接查特定人。</p>
-      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="在已載入資料中搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
+      <p class="hint" style="margin-bottom:10px">📄 ${cappedNote}搜尋只會在這裡顯示的資料中查找。找不到的話，用下方「查詢單一學生完整紀錄」直接查特定人，不受這個上限影響。</p>
+      <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="在上面資料中搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
       <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
-      <div class="btnrow">
-        ${STATE.teacherRecordsHasMore ? `<button class="btn btn-ghost btn-sm" data-action="load-more-teacher-records">${STATE.teacherRecordsLoading?'載入中…':'載入更早的紀錄'}</button>` : `<span class="hint">已載入所有紀錄</span>`}
-        <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV（含未載入的舊資料）</button>
-      </div>
+      <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV（含超出上限的舊資料）</button>
       <div class="spacer-24"></div>
       <div class="card" style="background:var(--cream-100)">
         <b>🔍 查詢單一學生完整紀錄</b>
-        <p class="hint" style="margin:6px 0 12px">直接輸入姓名和班級座號（需完全一致），查出這位學生的所有歷史紀錄，不受上面分頁限制。</p>
+        <p class="hint" style="margin:6px 0 12px">直接輸入姓名和班級座號（需完全一致），查出這位學生的所有歷史紀錄，不受上面的顯示上限影響。</p>
         <div class="field-row">
           <div class="field"><input type="text" id="teacherLookupName" placeholder="姓名，例如：王小明"></div>
           <div class="field"><input type="text" id="teacherLookupSeat" placeholder="班級座號，例如：503 02"></div>
@@ -1785,7 +1760,7 @@ async function renderTeacherAsync(forceRefresh=false){
     `;
     const draw = ()=>{
       const q = (document.getElementById('teacherSearch').value||'').trim();
-      const rows = q ? STATE.teacherRecords.filter(s=>(s.name||'').includes(q)||(s.seat||'').includes(q)||(s.examCode||'').includes(q)||(s.cls||'').includes(q)) : STATE.teacherRecords;
+      const rows = q ? recent.filter(s=>(s.name||'').includes(q)||(s.seat||'').includes(q)||(s.examCode||'').includes(q)||(s.cls||'').includes(q)) : recent;
       document.getElementById('teacherRecordsTbl').innerHTML = `<div class="tbl-wrap"><table><thead><tr>
         <th>時間</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>級別</th><th>分數</th><th>正確/總題</th><th>用時</th>
       </tr></thead><tbody>
@@ -1954,14 +1929,9 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='teacher-refresh'){
     STATE.cache.examcodes = null;
     STATE.cache.teacherStats = null;
-    STATE.teacherRecords = null;
+    STATE.cache.recentRecords = null;
     STATE.teacherLookupResult = null;
     STATE.teacherLookupError = null;
-    render();
-  }
-  else if(action==='load-more-teacher-records'){
-    if(STATE.teacherRecordsLoading) return;
-    await loadTeacherRecordsPage(false);
     render();
   }
   else if(action==='teacher-lookup-student'){
@@ -1985,6 +1955,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='leaderboard-refresh'){
     STATE.cache.lbSnapshot = null;
     STATE.cache.examcodes = null;
+    STATE.cache.teacherStats = null;
     render();
   }
   else if(action==='mock-leaderboard-refresh'){
@@ -2024,10 +1995,11 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     await sSet('snapshot:leaderboard', JSON.stringify([]), true);
     await sSet('snapshot:mockleaderboard', JSON.stringify([]), true);
     await sSet('snapshot:teacherstats', JSON.stringify(emptyStats), true);
+    await sSet('snapshot:recentrecords', JSON.stringify([]), true);
     STATE.cache.lbSnapshot = null;
     STATE.cache.mockLbSnapshot = null;
     STATE.cache.teacherStats = null;
-    STATE.teacherRecords = null;
+    STATE.cache.recentRecords = null;
     STATE.teacherLookupResult = null;
     toast('已清除所有作答紀錄');
     renderTeacherAsync();
@@ -2234,6 +2206,7 @@ async function finishSession(){
     STATE.cache.lbSnapshot = null;
     STATE.cache.mockLbSnapshot = null;
     STATE.cache.teacherStats = null;
+    STATE.cache.recentRecords = null;
 
     // Fire-and-forget the cheap-read-path maintenance writes. These must never block
     // or fail the student's result screen — the raw submission above is already safely
@@ -2286,6 +2259,10 @@ async function rebuildSnapshots(){
     });
     await sSet('snapshot:teacherstats', JSON.stringify(stats), true);
 
+    // all is already newest-first (fetchAllSubmissionsFullWithKeys sorts keys descending,
+    // and submission keys are timestamp-prefixed), so this is just a straight take.
+    await sSet('snapshot:recentrecords', JSON.stringify(all.slice(0, RECENT_RECORDS_CAP)), true);
+
     // Per-student mirrors, batched (Firestore caps a single batch at 500 writes).
     const BATCH_SIZE = 450;
     for(let i=0;i<withKeys.length;i+=BATCH_SIZE){
@@ -2302,6 +2279,7 @@ async function rebuildSnapshots(){
     STATE.cache.lbSnapshot = null;
     STATE.cache.mockLbSnapshot = null;
     STATE.cache.teacherStats = null;
+    STATE.cache.recentRecords = null;
     toast(`重建完成！共處理 ${all.length} 筆紀錄。`);
   }catch(e){
     console.error('rebuildSnapshots failed', e);
@@ -2362,6 +2340,16 @@ async function recordIntoFastPaths(record, subKey){
       stats.byExamCode[record.examCode] = (stats.byExamCode[record.examCode]||0) + 1;
     }
     return JSON.stringify(stats);
+  });
+
+  // 4) Teacher "學生紀錄" tab feed — unfiltered (every submission, not just leaderboard-
+  //    eligible ones), newest first, rolling window capped at RECENT_RECORDS_CAP.
+  await sTransactionUpdate('snapshot:recentrecords', (currentJson)=>{
+    let list = [];
+    if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
+    list.unshift(record);
+    if(list.length > RECENT_RECORDS_CAP) list.length = RECENT_RECORDS_CAP;
+    return JSON.stringify(list);
   });
 }
 
