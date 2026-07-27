@@ -755,7 +755,8 @@ const STATE = {
   mockLbLimit:50,
   teacherLookupResult:null, // result of the exact-student lookup tool (records tab)
   teacherLookupError:null,
-  rebuildBusy:false
+  rebuildBusy:false,
+  cleanupBusy:false
 };
 
 async function loadPersonal(){
@@ -1827,6 +1828,13 @@ async function renderTeacherAsync(forceRefresh=false){
         <button class="btn btn-secondary btn-sm" data-action="rebuild-snapshots" ${STATE.rebuildBusy?'disabled':''}>${STATE.rebuildBusy?'重建中，請稍候…':'重建排行榜快照'}</button>
       </div>
       <div class="spacer-24"></div>
+      <div class="card" style="background:var(--sun-100); border-color:#f0d090">
+        <b>🩹 清理異常分數紀錄</b>
+        <p class="hint" style="margin:6px 0 12px">如果發現排行榜上出現「正確題數超過總題數」的不合理分數（例如 123/100），這是快速連續點擊造成的重複送出，已經修正不會再發生。
+        點這裡可以清掉<b>已經產生</b>的異常紀錄：會刪除所有「正確題數 > 總題數」的作答紀錄（本人裝置上的錯題本、已標記狀態不受影響），完成後自動重建排行榜快照。</p>
+        <button class="btn btn-secondary btn-sm" data-action="cleanup-invalid-scores" ${STATE.cleanupBusy?'disabled':''}>${STATE.cleanupBusy?'清理中，請稍候…':'清理異常分數紀錄'}</button>
+      </div>
+      <div class="spacer-24"></div>
       <div class="card" style="background:var(--coral-100); border-color:#f0b8a9">
         <b style="color:#7a2e1c">危險操作</b>
         <p class="hint" style="margin:6px 0 12px">清除所有學生作答紀錄，此動作無法復原。</p>
@@ -1951,6 +1959,10 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='rebuild-snapshots'){
     const ok = await showConfirm('這會重新掃描全部歷史紀錄來重建排行榜快照，資料量大時可能需要一些時間、並消耗較多讀取額度。確定要繼續嗎？');
     if(ok){ await rebuildSnapshots(); }
+  }
+  else if(action==='cleanup-invalid-scores'){
+    const ok = await showConfirm('這會永久刪除所有「正確題數超過總題數」的異常作答紀錄，此動作無法復原。確定要繼續嗎？');
+    if(ok){ await cleanupInvalidScores(); }
   }
   else if(action==='leaderboard-refresh'){
     STATE.cache.lbSnapshot = null;
@@ -2110,6 +2122,8 @@ function mockTimerHtml(remainMs){
 async function forceFinishMockExam(){
   const sess = STATE.session;
   if(!sess) return;
+  if(sess.advancing) return; // a click on "next-question" is already mid-flight; let it finish
+  sess.advancing = true;
   // Commit whatever the student had selected on the question they were currently
   // viewing when time ran out — otherwise a correct-but-unsubmitted answer would be
   // wrongly counted as wrong just because they never clicked "下一題".
@@ -2159,10 +2173,17 @@ function handleAnswer(opt){
 function advanceSession(){
   const sess = STATE.session;
   if(!sess) return;
+  // Guards against rapid/repeated clicks on "next-question" (or a slow tap that fires
+  // twice): without this, clicking again during the async gap while finishSession()
+  // is still writing to Firestore would re-grade the same question a second time
+  // (correctCount++ again) and fire off another finishSession() call, producing
+  // impossible scores like 123/100 and duplicate submissions on the leaderboard.
+  if(sess.advancing) return;
+  sess.advancing = true;
   if(sess.kind==='challenge'){
     const qi = sess.qids[sess.idx];
     const opt = sess.selectedOption;
-    if(opt==null) return;
+    if(opt==null){ sess.advancing = false; return; }
     sess.results[sess.idx] = QDATA[qi][6]===opt;
     sess.answers[sess.idx] = opt;
     if(sess.results[sess.idx]) sess.correctCount++;
@@ -2171,20 +2192,27 @@ function advanceSession(){
     sess.idx++;
     sess.answered=false;
     sess.selectedOption=null;
+    sess.advancing = false;
     render();
   } else {
-    finishSession();
+    finishSession(); // leaves sess.advancing=true — the session is about to end anyway,
+                      // and this prevents any further clicks on the (still-visible until
+                      // finishSession's await resolves) button from doing anything at all.
   }
 }
 async function finishSession(){
   const sess = STATE.session;
   stopMockTimer();
   const durationSec = Math.round((Date.now()-sess.startedAt)/1000);
-  const wrongQids = sess.qids.filter((qi,i)=>sess.results[i]===false);
   const total = sess.qids.length;
+  // Defensive clamp: correctCount should never exceed total under correct operation,
+  // but this guarantees any bug (present or future) can never produce a stored score
+  // over 100%, on top of the reentrancy guard above that stops it from happening.
+  const correctClamped = Math.min(sess.correctCount, total);
+  const wrongQids = sess.qids.filter((qi,i)=>sess.results[i]===false);
   const summary = {
     qids: sess.qids, results: sess.results, answers: sess.answers,
-    correct: sess.correctCount, total, durationSec,
+    correct: correctClamped, total, durationSec,
     examCode: sess.examCode, examType: sess.examType || null
   };
   STATE.lastSummary = summary;
@@ -2197,7 +2225,7 @@ async function finishSession(){
       mode: sess.examCode ? 'group' : 'individual',
       examCode: sess.examCode || null,
       examType: sess.examType || null,
-      levels: sess.levels, total, correct: sess.correctCount,
+      levels: sess.levels, total, correct: correctClamped,
       score: Math.round(sess.correctCount/total*100),
       poolSize, wrongQids, durationSec, timestamp: Date.now()
     };
@@ -2236,11 +2264,11 @@ async function rebuildSnapshots(){
     const all = withKeys.map(x=>x.record);
     toast(`已讀取 ${all.length} 筆歷史紀錄，開始重建…`);
 
-    const lbList = all.filter(s=> s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS);
+    const lbList = all.filter(s=> s.correct<=s.total && s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS);
     lbList.sort((a,b)=>compareSubmissions(a,b,'combined'));
     await sSet('snapshot:leaderboard', JSON.stringify(lbList.slice(0,LEADERBOARD_SNAPSHOT_CAP)), true);
 
-    const mockList = all.filter(s=> s.examType==='mock' && s.score>=MOCK_EXAM_MIN_SCORE);
+    const mockList = all.filter(s=> s.correct<=s.total && s.examType==='mock' && s.score>=MOCK_EXAM_MIN_SCORE);
     mockList.sort((a,b)=> b.score-a.score || (a.durationSec||9e9)-(b.durationSec||9e9));
     await sSet('snapshot:mockleaderboard', JSON.stringify(mockList.slice(0,MOCK_LEADERBOARD_SNAPSHOT_CAP)), true);
 
@@ -2290,6 +2318,51 @@ async function rebuildSnapshots(){
   }
 }
 
+/* Removes raw submissions (and their per-student mirrors) where correct > total —
+   a state that is only reachable via the double-submit race condition this app used
+   to have (rapid clicks on the last question's "下一題" during the async gap while a
+   previous finishSession() write was still in flight). That race is now closed by the
+   sess.advancing guard in advanceSession()/forceFinishMockExam(), so this cleans up
+   only historical damage; it will not find new ones going forward. Submissions with
+   correct<=total (including any that are still below the leaderboard's question-count
+   or score threshold) are left untouched — this only removes what is provably
+   impossible, never anything that might be a legitimate, if unranked, attempt. */
+async function cleanupInvalidScores(){
+  if(!firebaseReady){ toast('Firestore 尚未設定，無法清理'); return; }
+  STATE.cleanupBusy = true;
+  render();
+  try{
+    const withKeys = await fetchAllSubmissionsFullWithKeys();
+    const bad = withKeys.filter(({record}) => record.correct > record.total);
+    if(bad.length===0){
+      toast('沒有發現任何異常分數紀錄，不需要清理。');
+      return;
+    }
+    toast(`發現 ${bad.length} 筆異常紀錄，正在刪除…`);
+    const keysToDelete = [];
+    bad.forEach(({key, record})=>{
+      keysToDelete.push(key);
+      const sk = studentKey(record.name, record.seat);
+      keysToDelete.push('mysub:'+sk+':'+key.slice('submission:'.length));
+    });
+    const BATCH_SIZE = 450;
+    for(let i=0;i<keysToDelete.length;i+=BATCH_SIZE){
+      const chunk = keysToDelete.slice(i, i+BATCH_SIZE);
+      const batch = db.batch();
+      chunk.forEach(k=>batch.delete(db.collection('kv').doc(k)));
+      await batch.commit();
+    }
+    toast(`已刪除 ${bad.length} 筆異常紀錄，正在重建排行榜快照…`);
+    await rebuildSnapshots(); // also resets the relevant caches and shows its own completion toast
+  }catch(e){
+    console.error('cleanupInvalidScores failed', e);
+    toast('清理失敗，請查看瀏覽器主控台錯誤訊息，或稍後再試一次。');
+  }finally{
+    STATE.cleanupBusy = false;
+    render();
+  }
+}
+
 async function recordIntoFastPaths(record, subKey){
   // 1) Per-student mirror so "我的挑戰紀錄" can query just this student's own rows
   //    instead of scanning every submission ever made.
@@ -2298,8 +2371,13 @@ async function recordIntoFastPaths(record, subKey){
 
   // 2) Leaderboard snapshot(s) — only touch the one this submission actually qualifies
   //    for, since updating a snapshot it would never appear on is wasted work.
+  //    record.correct<=record.total is a sanity guard: a record that somehow claims
+  //    more correct answers than questions asked is impossible under correct operation
+  //    and must never be allowed onto a public ranking, regardless of any other
+  //    eligibility rule.
+  const isSane = record.correct <= record.total;
   if(record.examType==='mock'){
-    if(record.score >= MOCK_EXAM_MIN_SCORE){
+    if(isSane && record.score >= MOCK_EXAM_MIN_SCORE){
       await sTransactionUpdate('snapshot:mockleaderboard', (currentJson)=>{
         let list = [];
         if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
@@ -2309,7 +2387,7 @@ async function recordIntoFastPaths(record, subKey){
         return JSON.stringify(list);
       });
     }
-  } else if(record.total >= MIN_LEADERBOARD_QUESTIONS){
+  } else if(isSane && record.total >= MIN_LEADERBOARD_QUESTIONS){
     await sTransactionUpdate('snapshot:leaderboard', (currentJson)=>{
       let list = [];
       if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
