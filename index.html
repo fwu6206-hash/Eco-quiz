@@ -239,6 +239,10 @@ input{font-family:inherit;}
 
 /* ---------- Question card ---------- */
 .qtag{display:inline-flex; align-items:center; gap:6px; background:var(--sky-100); color:var(--sky-500); font-size:0.72rem; font-weight:700; padding:4px 12px; border-radius:999px; margin-bottom:14px;}
+.report-btn{background:none; border:1px solid var(--line); color:var(--ink-400); font-size:0.7rem; padding:4px 10px; border-radius:999px; font-family:var(--font-body); flex:none; white-space:nowrap;}
+.report-btn:hover:not(:disabled){border-color:var(--coral-500); color:var(--coral-500);}
+.report-btn.done{color:var(--leaf-500); border-color:var(--leaf-300); background:var(--leaf-100);}
+.report-btn:disabled{cursor:default;}
 .qtext{font-size:1.18rem; font-weight:700; line-height:1.6; color:var(--ink-900); margin-bottom:20px;}
 .opt-list{display:flex; flex-direction:column; gap:10px;}
 .opt{
@@ -747,7 +751,7 @@ const STATE = {
   lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
   lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
   lbCustomLimit:'',
-  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null },
+  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null },
   loading:false,
   importBusy:false,
   importError:null,
@@ -757,7 +761,8 @@ const STATE = {
   teacherLookupError:null,
   rebuildBusy:false,
   cleanupBusy:false,
-  cleanupDupBusy:false
+  cleanupDupBusy:false,
+  reportedQids:new Set() // qids the student has flagged as broken during this page load, so the button doesn't invite repeat-clicking
 };
 
 async function loadPersonal(){
@@ -1057,6 +1062,7 @@ function viewSession(kind){
   const canNext = isPractice ? answered : sel!=null;
   const isLast = sess.idx === total-1;
   const isMock = sess.examType==='mock';
+  const alreadyReported = STATE.reportedQids.has(qi);
 
   return `
   <button class="backlink" data-action="confirm-exit-session">← 中途離開</button>
@@ -1066,7 +1072,12 @@ function viewSession(kind){
     <div class="trail-meta"><span>第 ${sess.idx+1} / ${total} 題</span><span>${isPractice?'答對 '+sess.correctCount+' 題':'作答模式 · 送出後才會顯示結果'}</span></div>
   </div>
   <div class="card">
-    <span class="qtag">${lv.name} · ${lv.tag}</span>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px">
+      <span class="qtag">${lv.name} · ${lv.tag}</span>
+      <button class="report-btn ${alreadyReported?'done':''}" data-action="report-question" data-qi="${qi}" ${alreadyReported?'disabled':''} title="題目顯示亂碼、符號跑掉、看不懂在問什麼？點這裡回報給老師">
+        ${alreadyReported?'✓ 已回報，謝謝':'🚩 題目顯示異常？回報'}
+      </button>
+    </div>
     <div class="qtext">${esc(q[1])}</div>
     <div class="opt-list">${opts}</div>
     ${explainHtml}
@@ -1322,6 +1333,12 @@ async function fetchRecentRecordsSnapshot(force=false){
   const list = await getJSON('snapshot:recentrecords', true, []);
   STATE.cache.recentRecords = Array.isArray(list) ? list : [];
   return STATE.cache.recentRecords;
+}
+async function fetchReportFreq(force=false){
+  if(STATE.cache.reportFreq && !force) return STATE.cache.reportFreq;
+  const freq = await getJSON('snapshot:reportfreq', true, {});
+  STATE.cache.reportFreq = (freq && typeof freq==='object') ? freq : {};
+  return STATE.cache.reportFreq;
 }
 async function fetchMyOwnSubmissions(name, seat){
   const sk = studentKey(name, seat);
@@ -1686,6 +1703,7 @@ function viewTeacherDashboard(){
       <button class="tab ${STATE.teacherTab==='overview'?'on':''}" data-action="teacher-tab" data-tab="overview">總覽</button>
       <button class="tab ${STATE.teacherTab==='records'?'on':''}" data-action="teacher-tab" data-tab="records">學生紀錄</button>
       <button class="tab ${STATE.teacherTab==='mistakes'?'on':''}" data-action="teacher-tab" data-tab="mistakes">錯題分析</button>
+      <button class="tab ${STATE.teacherTab==='reports'?'on':''}" data-action="teacher-tab" data-tab="reports">🚩 題目回報</button>
       <button class="tab ${STATE.teacherTab==='codes'?'on':''}" data-action="teacher-tab" data-tab="codes">考題代碼</button>
       <button class="tab ${STATE.teacherTab==='settings'?'on':''}" data-action="teacher-tab" data-tab="settings">設定</button>
     </div>
@@ -1709,6 +1727,7 @@ async function renderTeacherAsync(forceRefresh=false){
     STATE.cache.teacherStats = null;
     STATE.cache.examcodes = null;
     STATE.cache.recentRecords = null;
+    STATE.cache.reportFreq = null;
   }
   const codes = await fetchAllExamCodes(forceRefresh);
   if(STATE.view!=='teacher-dashboard') return;
@@ -1794,6 +1813,21 @@ async function renderTeacherAsync(forceRefresh=false){
       <div class="tbl-wrap"><table><thead><tr><th>題目</th><th>級別</th><th>答錯人次</th></tr></thead><tbody>
       ${top.map(([qi,n])=>{ const q=QDATA[qi]; const lv=levelInfo(q[0]); return `<tr><td style="white-space:normal;min-width:260px">${esc(q[1])}</td><td>${lv.name}</td><td><b>${n}</b></td></tr>`; }).join('')}
       </tbody></table></div>`;
+  }
+  else if(STATE.teacherTab==='reports'){
+    const freq = await fetchReportFreq(forceRefresh);
+    if(STATE.view!=='teacher-dashboard') return;
+    const top = Object.entries(freq).filter(([,n])=>n>0).sort((a,b)=>b[1]-a[1]);
+    el.innerHTML = `
+      <p class="h-sub" style="margin-bottom:14px">學生回報「顯示異常、看不懂在問什麼」的題目，通常是原始題庫裡有亂碼或特殊符號（例如變成一堆「？」），建議依回報次數優先處理，修好後點「標記已處理」讓它從清單移除。</p>
+      ${top.length===0 ? `<div class="empty-state">${ICONS.leaf}<p>目前沒有學生回報顯示異常的題目。</p></div>` : `
+      <div class="tbl-wrap"><table><thead><tr><th>#</th><th>題目內容</th><th>級別</th><th>回報次數</th><th></th></tr></thead><tbody>
+      ${top.map(([qi,n])=>{
+        const q = QDATA[qi]; const lv = q ? levelInfo(q[0]) : null;
+        return `<tr><td>${qi}</td><td style="white-space:normal;min-width:260px">${q?esc(q[1]):'（題目索引超出範圍，可能題庫已更新）'}</td><td>${lv?lv.name:'—'}</td><td><b>${n}</b></td>
+        <td><button class="btn btn-ghost btn-sm" data-action="resolve-report" data-qi="${qi}">標記已處理</button></td></tr>`;
+      }).join('')}
+      </tbody></table></div>`}`;
   }
   else if(STATE.teacherTab==='codes'){
     const stats = await fetchTeacherStats(forceRefresh);
@@ -1891,6 +1925,9 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='next-question'){
     advanceSession();
   }
+  else if(action==='report-question'){
+    reportQuestionIssue(Number(el.dataset.qi));
+  }
   else if(action==='confirm-exit-session'){
     const ok = await showConfirm('確定要離開嗎？本次作答進度將不會被記錄。');
     if(ok){
@@ -1946,6 +1983,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     STATE.cache.examcodes = null;
     STATE.cache.teacherStats = null;
     STATE.cache.recentRecords = null;
+    STATE.cache.reportFreq = null;
     STATE.teacherLookupResult = null;
     STATE.teacherLookupError = null;
     render();
@@ -1996,6 +2034,18 @@ document.getElementById('app').addEventListener('click', async (e)=>{
       STATE.cache.examcodes=null;
       renderTeacherAsync();
     }
+  }
+  else if(action==='resolve-report'){
+    const qi = el.dataset.qi;
+    await sTransactionUpdate('snapshot:reportfreq', (currentJson)=>{
+      let freq = {};
+      if(currentJson){ try{ freq = JSON.parse(currentJson)||{}; }catch(e){} }
+      delete freq[qi];
+      return JSON.stringify(freq);
+    });
+    STATE.cache.reportFreq = null;
+    toast('已標記為處理完成');
+    renderTeacherAsync();
   }
   else if(action==='clear-all-submissions'){
     const ok1 = await showConfirm('這將永久刪除所有學生作答紀錄（含排行榜快照與個人紀錄），確定要繼續嗎？', true);
@@ -2453,6 +2503,34 @@ async function cleanupDuplicateSessions(){
   }finally{
     STATE.cleanupDupBusy = false;
     render();
+  }
+}
+
+/* Lets a student flag a question that isn't displaying properly (garbled symbols,
+   repeated "？？？", etc.) so a teacher can find and fix it in the source question
+   bank. Writes a small raw log entry (for audit / rebuild) and keeps a running
+   per-question count in a single small snapshot document — same scalable pattern as
+   everything else, cheap to read regardless of how many reports pile up, since the
+   snapshot is just "{qid: count}", not a growing list of full records. */
+async function reportQuestionIssue(qi){
+  if(STATE.reportedQids.has(qi)) return;
+  STATE.reportedQids.add(qi);
+  toast('已回報，謝謝提醒！老師會盡快確認這一題。');
+  render();
+  if(!firebaseReady) return;
+  try{
+    const p = STATE.profile;
+    const key = 'qreport:'+Date.now()+'_'+uid();
+    await sSet(key, JSON.stringify({ qi, name:p.name||'', seat:p.seat||'', timestamp:Date.now() }), true);
+    await sTransactionUpdate('snapshot:reportfreq', (currentJson)=>{
+      let freq = {};
+      if(currentJson){ try{ freq = JSON.parse(currentJson)||{}; }catch(e){} }
+      freq[qi] = (freq[qi]||0) + 1;
+      return JSON.stringify(freq);
+    });
+    STATE.cache.reportFreq = null;
+  }catch(e){
+    console.error('reportQuestionIssue failed', e);
   }
 }
 
