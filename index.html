@@ -756,7 +756,8 @@ const STATE = {
   teacherLookupResult:null, // result of the exact-student lookup tool (records tab)
   teacherLookupError:null,
   rebuildBusy:false,
-  cleanupBusy:false
+  cleanupBusy:false,
+  cleanupDupBusy:false
 };
 
 async function loadPersonal(){
@@ -1835,6 +1836,13 @@ async function renderTeacherAsync(forceRefresh=false){
         <button class="btn btn-secondary btn-sm" data-action="cleanup-invalid-scores" ${STATE.cleanupBusy?'disabled':''}>${STATE.cleanupBusy?'清理中，請稍候…':'清理異常分數紀錄'}</button>
       </div>
       <div class="spacer-24"></div>
+      <div class="card" style="background:var(--sun-100); border-color:#f0d090">
+        <b>🩹 清理重複挑戰紀錄</b>
+        <p class="hint" style="margin:6px 0 12px">如果發現排行榜被同一位學生的一整排連續分數（例如 100分、99分、98分…）佔滿，代表同一次挑戰被重複寫入了很多筆——原因已經修正不會再發生。
+        點這裡可以清掉<b>已經產生</b>的重複紀錄：會找出同一位學生、同樣題數與級別、時間相近（10分鐘內）的一群紀錄，只保留其中<b>正確題數最高</b>的一筆（最能代表那次挑戰的真實結果），其餘刪除，完成後自動重建排行榜快照。</p>
+        <button class="btn btn-secondary btn-sm" data-action="cleanup-duplicate-sessions" ${STATE.cleanupDupBusy?'disabled':''}>${STATE.cleanupDupBusy?'清理中，請稍候…':'清理重複挑戰紀錄'}</button>
+      </div>
+      <div class="spacer-24"></div>
       <div class="card" style="background:var(--coral-100); border-color:#f0b8a9">
         <b style="color:#7a2e1c">危險操作</b>
         <p class="hint" style="margin:6px 0 12px">清除所有學生作答紀錄，此動作無法復原。</p>
@@ -1963,6 +1971,10 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='cleanup-invalid-scores'){
     const ok = await showConfirm('這會永久刪除所有「正確題數超過總題數」的異常作答紀錄，此動作無法復原。確定要繼續嗎？');
     if(ok){ await cleanupInvalidScores(); }
+  }
+  else if(action==='cleanup-duplicate-sessions'){
+    const ok = await showConfirm('這會找出同一位學生、同樣設定、時間相近的重複紀錄，只保留正確題數最高的一筆，其餘永久刪除，此動作無法復原。確定要繼續嗎？');
+    if(ok){ await cleanupDuplicateSessions(); }
   }
   else if(action==='leaderboard-refresh'){
     STATE.cache.lbSnapshot = null;
@@ -2202,6 +2214,15 @@ function advanceSession(){
 }
 async function finishSession(){
   const sess = STATE.session;
+  // Hard guard: no matter WHAT causes finishSession() to be invoked more than once for
+  // the same session (rapid clicks, a slow network widening the async gap, duplicate
+  // event handling, or any other trigger not yet identified) — only the very first
+  // call is allowed to actually grade/write anything. Every call after that is a no-op.
+  // This closes the whole class of "one challenge produces many leaderboard rows" bugs
+  // at the one place that actually matters (the write itself), rather than trying to
+  // guard every possible call site.
+  if(!sess || sess.submitted) return;
+  sess.submitted = true;
   stopMockTimer();
   const durationSec = Math.round((Date.now()-sess.startedAt)/1000);
   const total = sess.qids.length;
@@ -2359,6 +2380,78 @@ async function cleanupInvalidScores(){
     toast('清理失敗，請查看瀏覽器主控台錯誤訊息，或稍後再試一次。');
   }finally{
     STATE.cleanupBusy = false;
+    render();
+  }
+}
+
+/* Removes duplicate submissions produced by the same single challenge attempt being
+   written to the database more than once (e.g. from the double-submit race condition
+   that finishSession()'s "submitted" guard now prevents going forward — this cleans up
+   damage from before that fix was deployed, or from any other future cause of the same
+   symptom). Records are clustered per-student by matching setup (total/examType/levels)
+   and time proximity (gap <= DUPLICATE_CLUSTER_GAP_MS from the previous record in the
+   group); within a cluster of 2+, only the one with the highest correct count is kept
+   — that one reflects the most progress made in what was really a single attempt — and
+   the rest are deleted. Clusters of exactly 1 are genuine separate attempts and are
+   left alone entirely. */
+const DUPLICATE_CLUSTER_GAP_MS = 10*60*1000; // 10 minutes
+async function cleanupDuplicateSessions(){
+  if(!firebaseReady){ toast('Firestore 尚未設定，無法清理'); return; }
+  STATE.cleanupDupBusy = true;
+  render();
+  try{
+    const withKeys = await fetchAllSubmissionsFullWithKeys();
+    const groups = {};
+    withKeys.forEach(item=>{
+      const r = item.record;
+      const gk = [r.name, r.seat, r.total, r.examType||'', (r.levels||[]).slice().sort((a,b)=>a-b).join(',')].join('|');
+      (groups[gk] = groups[gk] || []).push(item);
+    });
+    const toDelete = [];
+    Object.values(groups).forEach(items=>{
+      items.sort((a,b)=>a.record.timestamp-b.record.timestamp);
+      let cluster = [];
+      const flushCluster = ()=>{
+        if(cluster.length>1){
+          cluster.sort((a,b)=> b.record.correct-a.record.correct || a.record.timestamp-b.record.timestamp);
+          for(let i=1;i<cluster.length;i++) toDelete.push(cluster[i]);
+        }
+        cluster = [];
+      };
+      items.forEach(item=>{
+        if(cluster.length>0 && item.record.timestamp - cluster[cluster.length-1].record.timestamp > DUPLICATE_CLUSTER_GAP_MS){
+          flushCluster();
+        }
+        cluster.push(item);
+      });
+      flushCluster();
+    });
+
+    if(toDelete.length===0){
+      toast('沒有發現疑似重複的挑戰紀錄，不需要清理。');
+      return;
+    }
+    toast(`發現 ${toDelete.length} 筆疑似重複紀錄，正在刪除…`);
+    const keysToDelete = [];
+    toDelete.forEach(({key, record})=>{
+      keysToDelete.push(key);
+      const sk = studentKey(record.name, record.seat);
+      keysToDelete.push('mysub:'+sk+':'+key.slice('submission:'.length));
+    });
+    const BATCH_SIZE = 450;
+    for(let i=0;i<keysToDelete.length;i+=BATCH_SIZE){
+      const chunk = keysToDelete.slice(i, i+BATCH_SIZE);
+      const batch = db.batch();
+      chunk.forEach(k=>batch.delete(db.collection('kv').doc(k)));
+      await batch.commit();
+    }
+    toast(`已刪除 ${toDelete.length} 筆重複紀錄，正在重建排行榜快照…`);
+    await rebuildSnapshots();
+  }catch(e){
+    console.error('cleanupDuplicateSessions failed', e);
+    toast('清理失敗，請查看瀏覽器主控台錯誤訊息，或稍後再試一次。');
+  }finally{
+    STATE.cleanupDupBusy = false;
     render();
   }
 }
