@@ -416,12 +416,64 @@ const QDATA_DEFAULT=[[1,"下列哪一項「不是」臺灣地層下陷的主因�
 /* QDATA_DEFAULT is embedded directly above this line at build time (the full question
    bank baked into the file, so the app works immediately with zero setup). Firestore can
    still hold a *newer* version if a teacher re-imports an updated bank later via the
-   Settings tab — if present, that version takes priority over the baked-in default. */
+   Settings tab — if present, that version takes priority over the baked-in default.
+
+   A full question bank this size (~6000 rows) serializes to roughly 2.4MB of JSON, but
+   Firestore hard-caps a single document at 1MiB — so it can never be stored as one
+   document's field. It's written as several chunk documents instead (each comfortably
+   under that cap) plus one small manifest document recording how many chunks there are;
+   loading concatenates them back into one array. The old code stored it as a single
+   document, which silently failed to write for any realistically-sized bank — the
+   in-memory value still updated (so the on-screen "匯入成功" count looked right for the
+   rest of that page load), but nothing persisted, so every fresh page load reverted to
+   the baked-in default. This is exactly that bug, fixed at the root. */
 let QDATA = (typeof QDATA_DEFAULT !== 'undefined') ? QDATA_DEFAULT : [];
 let QDATA_SOURCE = 'default'; // 'default' (baked-in) or 'imported' (an override was ever active)
 const QDATA_STORAGE_KEY = 'qdata_v1';
 const QDATA_EXPECTED_MIN = 3000; // sanity floor so a bad/partial upload doesn't silently "succeed"
+const QDATA_CHUNK_BYTE_LIMIT = 700000; // safely under Firestore's 1MiB per-document cap
+
+function chunkQDataForStorage(parsed){
+  const chunks = [];
+  let current = [];
+  let currentSize = 2; // for the [ ]
+  for(const row of parsed){
+    const addSize = JSON.stringify(row).length + 1;
+    if(current.length>0 && currentSize + addSize > QDATA_CHUNK_BYTE_LIMIT){
+      chunks.push(current);
+      current = [];
+      currentSize = 2;
+    }
+    current.push(row);
+    currentSize += addSize;
+  }
+  if(current.length>0) chunks.push(current);
+  return chunks;
+}
+
 async function tryLoadQDATAFromStorage(){
+  // New sharded format first.
+  const metaRaw = await sGet(QDATA_STORAGE_KEY+'_meta', true);
+  if(metaRaw){
+    try{
+      const meta = JSON.parse(metaRaw);
+      if(meta && meta.chunkCount>0){
+        const parts = [];
+        for(let i=0;i<meta.chunkCount;i++){
+          const raw = await sGet(QDATA_STORAGE_KEY+'_chunk'+i, true);
+          if(!raw) throw new Error('missing chunk '+i);
+          parts.push(JSON.parse(raw));
+        }
+        const combined = [].concat(...parts);
+        if(Array.isArray(combined) && combined.length >= QDATA_EXPECTED_MIN){
+          QDATA = combined;
+          QDATA_SOURCE = 'imported';
+          return true;
+        }
+      }
+    }catch(e){ console.error('QDATA chunk load failed, falling back', e); }
+  }
+  // Backward compatibility: an older single-document import from before chunking existed.
   const raw = await sGet(QDATA_STORAGE_KEY, true);
   if(!raw) return false;
   try{
@@ -432,12 +484,23 @@ async function tryLoadQDATAFromStorage(){
     return true;
   }catch(e){ return false; }
 }
-/* Deletes any imported override in Firestore and falls back to the corrected, baked-in
-   default — for recovering from a stale/bad override uploaded at some point in the past
-   (e.g. during earlier testing), which would otherwise silently keep serving to everyone
-   even after the shipped default has since been fixed. */
+/* Deletes any imported override in Firestore (both the current sharded format and any
+   leftover old-style single document) and falls back to the corrected, baked-in default
+   — for recovering from a stale/bad override uploaded at some point in the past (e.g.
+   during earlier testing), which would otherwise silently keep serving to everyone even
+   after the shipped default has since been fixed. */
 async function restoreDefaultQDATA(){
-  await sDel(QDATA_STORAGE_KEY, true);
+  const metaRaw = await sGet(QDATA_STORAGE_KEY+'_meta', true);
+  if(metaRaw){
+    try{
+      const meta = JSON.parse(metaRaw);
+      if(meta && meta.chunkCount>0){
+        for(let i=0;i<meta.chunkCount;i++){ await sDel(QDATA_STORAGE_KEY+'_chunk'+i, true); }
+      }
+    }catch(e){}
+    await sDel(QDATA_STORAGE_KEY+'_meta', true);
+  }
+  await sDel(QDATA_STORAGE_KEY, true); // old-style leftover, if any
   QDATA = (typeof QDATA_DEFAULT !== 'undefined') ? QDATA_DEFAULT : [];
   QDATA_SOURCE = 'default';
 }
@@ -446,7 +509,29 @@ async function importQDATAFromText(text){
   if(!Array.isArray(parsed) || parsed.length < QDATA_EXPECTED_MIN){
     throw new Error(`檔案內容看起來不完整（僅 ${Array.isArray(parsed)?parsed.length:0} 筆），請確認上傳的是正確的題庫 JSON 檔。`);
   }
-  await sSet(QDATA_STORAGE_KEY, JSON.stringify(parsed), true);
+  const chunks = chunkQDataForStorage(parsed);
+  for(let i=0;i<chunks.length;i++){
+    const ok = await sSet(QDATA_STORAGE_KEY+'_chunk'+i, JSON.stringify(chunks[i]), true);
+    if(!ok) throw new Error(`題庫寫入 Firestore 失敗（第 ${i+1}/${chunks.length} 段），可能是網路不穩定，請檢查連線後再試一次。目前畫面仍會顯示新題庫，但重新整理後會恢復成上一個版本，請務必重試到成功為止。`);
+  }
+  // Clean up chunks left over from a previous, larger import before writing the new
+  // manifest — otherwise a shrink (e.g. re-importing a smaller bank later) would leave
+  // orphaned old chunks sitting in Firestore forever (harmless to reads, since only
+  // chunks up to the new count are ever read, but no reason to leave them behind).
+  const prevMetaRaw = await sGet(QDATA_STORAGE_KEY+'_meta', true);
+  if(prevMetaRaw){
+    try{
+      const prevMeta = JSON.parse(prevMetaRaw);
+      if(prevMeta && prevMeta.chunkCount > chunks.length){
+        for(let i=chunks.length;i<prevMeta.chunkCount;i++){ await sDel(QDATA_STORAGE_KEY+'_chunk'+i, true); }
+      }
+    }catch(e){}
+  }
+  const metaOk = await sSet(QDATA_STORAGE_KEY+'_meta', JSON.stringify({chunkCount:chunks.length, total:parsed.length}), true);
+  if(!metaOk){
+    throw new Error('題庫寫入 Firestore 失敗（索引資訊），可能是網路不穩定，請檢查連線後再試一次。');
+  }
+  await sDel(QDATA_STORAGE_KEY, true); // clear any old-style leftover so it can't shadow the new import
   QDATA = parsed;
   QDATA_SOURCE = 'imported';
 }
