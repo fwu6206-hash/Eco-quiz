@@ -583,6 +583,15 @@ const LEVELS = [
 const LEVEL_GROUP = LEVELS.filter(l=>l.group==='level');
 const VIDEO_GROUP = LEVELS.filter(l=>l.group==='video');
 const COUNT_PRESETS = [10,20,50,80,100];
+/* Group challenge codes are meant for a class/cohort to compare a genuinely common
+   set of questions — not as a way to generate a personal, uncontested "first place"
+   entry. To keep that meaningful: a code must set at least this many questions at
+   creation time, and (checked later, since it can only be known after the fact) must
+   actually be used by at least this many distinct students, or it — and any scores
+   submitted under it — get cleaned up as noise. */
+const GROUP_CODE_MIN_QUESTIONS = 50;
+const GROUP_CODE_MIN_PARTICIPANTS = 5;
+const GROUP_CODE_GRACE_PERIOD_MS = 24*60*60*1000; // don't judge a code as "underused" until it's had a full day for people to actually join
 
 function levelInfo(k){ return LEVELS.find(l=>l.key===k) || LEVELS[0]; }
 
@@ -859,6 +868,7 @@ const STATE = {
   rebuildBusy:false,
   cleanupBusy:false,
   cleanupDupBusy:false,
+  cleanupCodesBusy:false,
   reportedQids:new Set() // qids the student has flagged as broken during this page load, so the button doesn't invite repeat-clicking
 };
 
@@ -1306,17 +1316,21 @@ function viewGroupMenu(){
 function viewGroupCreate(){
   const s = STATE.setup;
   const pool = buildPool(s.levels);
+  const validPresets = COUNT_PRESETS.filter(c => c >= GROUP_CODE_MIN_QUESTIONS);
   return `
   <button class="backlink" data-action="go" data-view="challenge-group-menu">← 返回</button>
   <div class="card">
     <span class="section-eyebrow">STEP 1 · 選擇級別與影片單元、題數</span>
     <h2 class="h-title">建立新考題代碼</h2>
+    <div class="video-intro">
+      📋 考題代碼是設計給<b>一群人共同作答同一份題目</b>來比較實力用的，為避免被拿來當作衝個人排名的捷徑，建立時<b>至少需要 ${GROUP_CODE_MIN_QUESTIONS} 題</b>；建立後若超過一天仍未有<b>至少 ${GROUP_CODE_MIN_PARTICIPANTS} 位不同學生</b>加入作答，這組代碼與相關成績會被視為未達標準而清除。
+    </div>
     ${renderLevelGrid(s.levels)}
     <div class="count-row">
-      ${COUNT_PRESETS.map(c=>`<button class="count-chip ${s.count===c && !s.customCount?'on':''}" data-action="set-count" data-count="${c}">${c} 題</button>`).join('')}
+      ${validPresets.map(c=>`<button class="count-chip ${s.count===c && !s.customCount?'on':''}" data-action="set-count" data-count="${c}">${c} 題</button>`).join('')}
       <div class="count-custom">
-        <input type="number" min="1" max="${pool.length||1}" placeholder="自訂" id="customCountInput" value="${esc(s.customCount)}">
-        <span>題（自訂）</span>
+        <input type="number" min="${GROUP_CODE_MIN_QUESTIONS}" max="${pool.length||GROUP_CODE_MIN_QUESTIONS}" placeholder="自訂" id="customCountInput" value="${esc(s.customCount)}">
+        <span>題（自訂，最少 ${GROUP_CODE_MIN_QUESTIONS} 題）</span>
       </div>
     </div>
     <p class="hint" style="margin-top:8px">目前可出題數：<b>${pool.length}</b> 題</p>
@@ -1929,11 +1943,16 @@ async function renderTeacherAsync(forceRefresh=false){
   else if(STATE.teacherTab==='codes'){
     const stats = await fetchTeacherStats(forceRefresh);
     if(STATE.view!=='teacher-dashboard') return;
+    const now = Date.now();
     el.innerHTML = codes.length===0 ? `<div class="empty-state">${ICONS.users}<p>尚未建立任何考題代碼。</p></div>` : `
+      <p class="hint" style="margin-bottom:12px">💡「參與人次」是作答次數（同一人重複作答也會累加），實際的<b>不同學生人數</b>要在下面「清理未達標考題代碼」執行時才會精確計算。標示 ⚠️ 的代碼，代表已建立超過一天、且作答人次未滿 ${GROUP_CODE_MIN_PARTICIPANTS} 次，很可能會在下次清理時被移除。</p>
       <div class="tbl-wrap"><table><thead><tr><th>代碼</th><th>級別</th><th>題數</th><th>建立者</th><th>建立時間</th><th>參與人次</th><th></th></tr></thead><tbody>
       ${codes.slice().sort((a,b)=>b.createdAt-a.createdAt).map(c=>{
         const n = (stats.byExamCode||{})[c.code] || 0;
-        return `<tr><td><b>${esc(c.code)}</b></td><td>${c.levels.map(k=>levelInfo(k).name).join('、')}</td><td>${c.qids.length}</td><td>${esc(c.creator||'—')}</td><td>${fmtTime(c.createdAt)}</td><td>${n}</td>
+        const pastGrace = (now - (c.createdAt||0)) > GROUP_CODE_GRACE_PERIOD_MS;
+        const tooFewQuestions = (c.qids||[]).length < GROUP_CODE_MIN_QUESTIONS;
+        const atRisk = tooFewQuestions || (pastGrace && n < GROUP_CODE_MIN_PARTICIPANTS);
+        return `<tr${atRisk?' style="opacity:0.6"':''}><td><b>${esc(c.code)}</b>${atRisk?' ⚠️':''}</td><td>${c.levels.map(k=>levelInfo(k).name).join('、')}</td><td>${c.qids.length}${tooFewQuestions?' ⚠️':''}</td><td>${esc(c.creator||'—')}</td><td>${fmtTime(c.createdAt)}</td><td>${n}</td>
         <td><button class="btn btn-ghost btn-sm" data-action="delete-examcode" data-code="${esc(c.code)}">刪除</button></td></tr>`;
       }).join('')}
       </tbody></table></div>`;
@@ -1975,6 +1994,12 @@ async function renderTeacherAsync(forceRefresh=false){
         <p class="hint" style="margin:6px 0 12px">如果發現排行榜被同一位學生的一整排連續分數（例如 100分、99分、98分…）佔滿，代表同一次挑戰被重複寫入了很多筆——原因已經修正不會再發生。
         點這裡可以清掉<b>已經產生</b>的重複紀錄：會找出同一位學生、同樣題數與級別、時間相近（10分鐘內）的一群紀錄，只保留其中<b>正確題數最高</b>的一筆（最能代表那次挑戰的真實結果），其餘刪除，完成後自動重建排行榜快照。</p>
         <button class="btn btn-secondary btn-sm" data-action="cleanup-duplicate-sessions" ${STATE.cleanupDupBusy?'disabled':''}>${STATE.cleanupDupBusy?'清理中，請稍候…':'清理重複挑戰紀錄'}</button>
+      </div>
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--sun-100); border-color:#f0d090">
+        <b>🩹 清理未達標考題代碼</b>
+        <p class="hint" style="margin:6px 0 12px">考題代碼是設計給一群人共同作答比較實力用的。點這裡會清除：(1) 題數不足 ${GROUP_CODE_MIN_QUESTIONS} 題的代碼，以及 (2) 建立超過一天、卻仍未滿 ${GROUP_CODE_MIN_PARTICIPANTS} 位不同學生使用的代碼——這兩種都會直接<b>刪除該代碼與其下所有相關成績</b>，此動作無法復原。剛建立不到一天的代碼不會受影響，不用擔心誤刪。</p>
+        <button class="btn btn-secondary btn-sm" data-action="cleanup-underused-codes" ${STATE.cleanupCodesBusy?'disabled':''}>${STATE.cleanupCodesBusy?'清理中，請稍候…':'清理未達標考題代碼'}</button>
       </div>
       <div class="spacer-24"></div>
       <div class="card" style="background:var(--coral-100); border-color:#f0b8a9">
@@ -2121,6 +2146,10 @@ document.getElementById('app').addEventListener('click', async (e)=>{
   else if(action==='cleanup-duplicate-sessions'){
     const ok = await showConfirm('這會找出同一位學生、同樣設定、時間相近的重複紀錄，只保留正確題數最高的一筆，其餘永久刪除，此動作無法復原。確定要繼續嗎？');
     if(ok){ await cleanupDuplicateSessions(); }
+  }
+  else if(action==='cleanup-underused-codes'){
+    const ok = await showConfirm(`這會刪除題數不足 ${GROUP_CODE_MIN_QUESTIONS} 題、或建立超過一天仍未滿 ${GROUP_CODE_MIN_PARTICIPANTS} 位學生使用的考題代碼，以及其下所有相關成績，此動作無法復原。確定要繼續嗎？`);
+    if(ok){ await cleanupUnderusedExamCodes(); }
   }
   else if(action==='leaderboard-refresh'){
     STATE.cache.lbSnapshot = null;
@@ -2614,6 +2643,79 @@ async function cleanupDuplicateSessions(){
   }
 }
 
+/* Removes exam codes (and every submission made under them) that never turned into
+   the group comparison they're meant for: either the code was set up with fewer than
+   GROUP_CODE_MIN_QUESTIONS questions (only possible for codes created before that
+   minimum was enforced at creation time), or it's been open for at least a full day
+   and still hasn't attracted GROUP_CODE_MIN_PARTICIPANTS distinct students. A fresh
+   code within its first day is never touched, even with zero participants so far —
+   people need time to actually join before "nobody's used this" is a fair judgment. */
+async function cleanupUnderusedExamCodes(){
+  if(!firebaseReady){ toast('Firestore 尚未設定，無法清理'); return; }
+  STATE.cleanupCodesBusy = true;
+  render();
+  try{
+    const codes = await fetchAllExamCodes(true);
+    if(codes.length===0){
+      toast('目前沒有任何考題代碼。');
+      return;
+    }
+    const withKeys = await fetchAllSubmissionsFullWithKeys();
+    const byCode = {};
+    withKeys.forEach(item=>{
+      const code = item.record.examCode;
+      if(!code) return;
+      (byCode[code] = byCode[code] || []).push(item);
+    });
+
+    const now = Date.now();
+    const codesToDelete = [];
+    for(const code of codes){
+      const items = byCode[code.code] || [];
+      const distinctParticipants = new Set(items.map(({record})=>studentKey(record.name, record.seat))).size;
+      const tooFewQuestions = (code.qids||[]).length < GROUP_CODE_MIN_QUESTIONS;
+      const pastGracePeriod = (now - (code.createdAt||0)) > GROUP_CODE_GRACE_PERIOD_MS;
+      const tooFewParticipants = pastGracePeriod && distinctParticipants < GROUP_CODE_MIN_PARTICIPANTS;
+      if(tooFewQuestions || tooFewParticipants){
+        codesToDelete.push({ code, items, reason: tooFewQuestions ? '題數不足' : `僅 ${distinctParticipants} 位學生使用` });
+      }
+    }
+
+    if(codesToDelete.length===0){
+      toast('所有考題代碼都符合標準，不需要清理。');
+      return;
+    }
+
+    toast(`發現 ${codesToDelete.length} 組未達標準的考題代碼，正在清除…`);
+    const keysToDelete = [];
+    codesToDelete.forEach(({code, items})=>{
+      keysToDelete.push('examcode:'+code.code);
+      items.forEach(({key, record})=>{
+        keysToDelete.push(key);
+        const sk = studentKey(record.name, record.seat);
+        keysToDelete.push('mysub:'+sk+':'+key.slice('submission:'.length));
+      });
+    });
+    const BATCH_SIZE = 450;
+    for(let i=0;i<keysToDelete.length;i+=BATCH_SIZE){
+      const chunk = keysToDelete.slice(i, i+BATCH_SIZE);
+      const batch = db.batch();
+      chunk.forEach(k=>batch.delete(db.collection('kv').doc(k)));
+      await batch.commit();
+    }
+    const totalSubsRemoved = codesToDelete.reduce((a,c)=>a+c.items.length,0);
+    toast(`已清除 ${codesToDelete.length} 組考題代碼、${totalSubsRemoved} 筆相關成績，正在重建排行榜快照…`);
+    STATE.cache.examcodes = null;
+    await rebuildSnapshots();
+  }catch(e){
+    console.error('cleanupUnderusedExamCodes failed', e);
+    toast('清理失敗，請查看瀏覽器主控台錯誤訊息，或稍後再試一次。');
+  }finally{
+    STATE.cleanupCodesBusy = false;
+    render();
+  }
+}
+
 /* Lets a student flag a question that isn't displaying properly (garbled symbols,
    repeated "？？？", etc.) so a teacher can find and fix it in the source question
    bank. Writes a small raw log entry (for audit / rebuild) and keeps a running
@@ -2715,6 +2817,10 @@ async function createGroupCode(){
   const pool = buildPool(s.levels);
   if(pool.length===0){ toast('請至少勾選一個有題目的級別'); return; }
   const n = Math.max(1, Math.min(s.count, pool.length));
+  if(n < GROUP_CODE_MIN_QUESTIONS){
+    toast(`考題代碼至少需要 ${GROUP_CODE_MIN_QUESTIONS} 題，請調整題數。`);
+    return;
+  }
   const qids = sample(pool, n);
   let code, tries=0;
   do{
