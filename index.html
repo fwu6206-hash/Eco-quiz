@@ -1493,9 +1493,34 @@ function compareSubmissions(a, b, sortBy){
       return (durA-durB) || (b.score-a.score) || (psB-psA) || (b.total-a.total);
     case 'combined':
     default:
-      // 預設綜合排名：題庫量 → 分數 → 練習題數 → 用時
-      return (psB-psA) || (b.score-a.score) || (b.total-a.total) || (durA-durB);
+      // 預設綜合排名：題庫量 → 同題庫量下一般隨機出題優先於團體代碼（代碼題目固定、重考可背答案，
+      // 隨機出題每次不同，較能反映真實實力）→ 分數 → 練習題數 → 用時
+      const groupPenaltyA = a.examCode ? 1 : 0;
+      const groupPenaltyB = b.examCode ? 1 : 0;
+      return (psB-psA) || (groupPenaltyA-groupPenaltyB) || (b.score-a.score) || (b.total-a.total) || (durA-durB);
   }
+}
+/* Group-code submissions only ever show ONE entry per student per code on the
+   leaderboard — their best attempt — no matter how many times they've retried that
+   same fixed question set. This is what actually stops "keep resubmitting the same
+   code until you've memorized it" from working: repeat attempts stop helping once
+   you've already got your best score in, and only ever cost you nothing extra to
+   try again (never occupies additional leaderboard rows). Individual/random
+   challenges are never deduplicated this way — a fresh random sample each time
+   makes memorization impractical, so repeated genuine high scores there are a real
+   signal, not the same exploit. */
+function dedupeGroupSubmissions(list){
+  const best = new Map(); // "examCode|studentKey" -> record
+  const passthrough = [];
+  for(const record of list){
+    if(!record.examCode){ passthrough.push(record); continue; }
+    const dedupeKey = record.examCode+'|'+studentKey(record.name, record.seat);
+    const existing = best.get(dedupeKey);
+    if(!existing || compareSubmissions(record, existing, 'combined') < 0){
+      best.set(dedupeKey, record);
+    }
+  }
+  return passthrough.concat([...best.values()]);
 }
 
 function submissionModeLabel(s){
@@ -2472,7 +2497,7 @@ async function rebuildSnapshots(){
     const all = withKeys.map(x=>x.record);
     toast(`已讀取 ${all.length} 筆歷史紀錄，開始重建…`);
 
-    const lbList = all.filter(s=> s.correct<=s.total && s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS);
+    const lbList = dedupeGroupSubmissions(all.filter(s=> s.correct<=s.total && s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS));
     lbList.sort((a,b)=>compareSubmissions(a,b,'combined'));
     await sSet('snapshot:leaderboard', JSON.stringify(lbList.slice(0,LEADERBOARD_SNAPSHOT_CAP)), true);
 
@@ -2773,6 +2798,7 @@ async function recordIntoFastPaths(record, subKey){
       let list = [];
       if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
       list.push(record);
+      list = dedupeGroupSubmissions(list);
       list.sort((a,b)=>compareSubmissions(a,b,'combined'));
       if(list.length > LEADERBOARD_SNAPSHOT_CAP) list.length = LEADERBOARD_SNAPSHOT_CAP;
       return JSON.stringify(list);
