@@ -633,6 +633,7 @@ const VIDEO_LIST = [
    Submissions below this threshold are excluded from the public ranking but are
    still stored and remain visible in the student's own history and to teachers. */
 const MIN_LEADERBOARD_QUESTIONS = 20;
+const MIN_LEADERBOARD_SCORE = 60; // for the leaderboard to stay a meaningful reference, low scores don't clutter it
 /* 考前模擬區：比照正式考試第一階段設定 — 全題庫（含影片單元）、80 題、限時 30 分鐘。
    這個模式有自己獨立的排行榜與入榜門檻（60 分），跟一般練習/挑戰的排行榜分開計算。 */
 const MOCK_EXAM_QUESTION_COUNT = 80;
@@ -1535,7 +1536,7 @@ function viewMyHistory(){
   <div class="card">
     <span class="section-eyebrow">${icon('target',16)} 個人專屬</span>
     <h2 class="h-title">我的挑戰紀錄</h2>
-    <p class="h-sub">這裡會列出你所有的挑戰成績，包含未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻、沒有出現在排行榜上的紀錄。</p>
+    <p class="h-sub">這裡會列出你所有的挑戰成績，包含未達 ${MIN_LEADERBOARD_QUESTIONS} 題或 ${MIN_LEADERBOARD_SCORE} 分入榜門檻、沒有出現在排行榜上的紀錄。</p>
     <div class="spacer-16"></div>
     <div id="myHistoryContent"><div class="loading"><span class="spin"></span>載入紀錄中…</div></div>
   </div>`;
@@ -1574,8 +1575,8 @@ async function renderMyHistoryAsync(){
   </tr></thead><tbody>
   ${mine.map(s=>{
     const isMock = s.examType==='mock';
-    const ranked = isMock ? (s.score >= MOCK_EXAM_MIN_SCORE) : (s.total >= MIN_LEADERBOARD_QUESTIONS);
-    const notRankedLabel = isMock ? `未達 ${MOCK_EXAM_MIN_SCORE} 分門檻` : `未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻`;
+    const ranked = isMock ? (s.score >= MOCK_EXAM_MIN_SCORE) : (s.total >= MIN_LEADERBOARD_QUESTIONS && s.score >= MIN_LEADERBOARD_SCORE);
+    const notRankedLabel = isMock ? `未達 ${MOCK_EXAM_MIN_SCORE} 分門檻` : (s.total < MIN_LEADERBOARD_QUESTIONS ? `未達 ${MIN_LEADERBOARD_QUESTIONS} 題門檻` : `未達 ${MIN_LEADERBOARD_SCORE} 分門檻`);
     return `<tr>
       <td>${fmtTime(s.timestamp)}</td>
       <td>${submissionModeLabel(s)}</td>
@@ -1700,7 +1701,7 @@ function viewLeaderboard(){
     </div>
     <div class="video-intro" style="margin-top:14px">
       📊 <b>排序原則：</b>預設採「綜合排名」，依序比較<b>題庫量（挑戰的級別/影片單元涵蓋越多題庫越優先）→ 分數 → 練習題數 → 用時</b>，避免只選少數簡單題庫就衝上第一名。也可以在下面切換排序依據，單獨看某一項目的排名。<br>
-      🛡️ <b>入榜門檻：</b>單次挑戰需作答滿 <b>${MIN_LEADERBOARD_QUESTIONS} 題</b>才會列入排行榜，避免用極少題數刷出無意義的高分；未達門檻的成績仍會保留，可在「我的挑戰紀錄」查看。榜單保留綜合排名前 <b>${LEADERBOARD_SNAPSHOT_CAP}</b> 名。
+      🛡️ <b>入榜門檻：</b>單次挑戰需作答滿 <b>${MIN_LEADERBOARD_QUESTIONS} 題</b>、且分數達 <b>${MIN_LEADERBOARD_SCORE} 分</b>以上才會列入排行榜，避免用極少題數或低分刷版；未達門檻的成績仍會保留，可在「我的挑戰紀錄」查看。榜單保留綜合排名前 <b>${LEADERBOARD_SNAPSHOT_CAP}</b> 名。
     </div>
     <div class="spacer-16"></div>
     <div id="lbFilters"></div>
@@ -1776,7 +1777,7 @@ async function renderLeaderboardAsync(){
     const me = STATE.profile;
     const excludedCount = Math.max(0, (stats.totalSubmissions||0) - subs.length);
     contentEl.innerHTML = `
-    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedCount>0?` 另外還有 <b>${excludedCount}</b> 筆挑戰紀錄因未達 ${MIN_LEADERBOARD_QUESTIONS} 題入榜門檻（或為模擬考成績）未列入這份排行榜，可到教師後台「學生紀錄」或自己的「我的挑戰紀錄」查看。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
+    <p class="hint" style="margin-bottom:10px">符合條件共 <b>${totalCount}</b> 筆，目前顯示 <b>${shown.length}</b> 筆。${excludedCount>0?` 另外還有 <b>${excludedCount}</b> 筆挑戰紀錄因未達 ${MIN_LEADERBOARD_QUESTIONS} 題或 ${MIN_LEADERBOARD_SCORE} 分入榜門檻（或為模擬考成績）未列入這份排行榜，可到教師後台「學生紀錄」或自己的「我的挑戰紀錄」查看。`:''}${STATE.profile.name?` <button class="btn btn-ghost btn-sm" data-action="go" data-view="my-history" style="margin-left:6px">查看我的挑戰紀錄</button>`:''}</p>
     <div class="tbl-wrap"><table><thead><tr>
       <th>名次</th><th>姓名</th><th>班級座號</th><th>學校</th><th>模式</th><th>題庫量</th><th>分數</th><th>練習題數</th><th>用時</th><th>時間</th>
     </tr></thead><tbody>
@@ -1849,7 +1850,7 @@ function viewTeacherDashboard(){
 
 function teacherRecordRowHtml(s){
   const isMock = s.examType==='mock';
-  const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS);
+  const belowThreshold = isMock ? (s.score < MOCK_EXAM_MIN_SCORE) : (s.total < MIN_LEADERBOARD_QUESTIONS || s.score < MIN_LEADERBOARD_SCORE);
   return `<tr${belowThreshold?' style="opacity:0.55"':''}>
     <td>${fmtTime(s.timestamp)}</td><td>${esc(s.name)}</td><td>${esc(s.seat||'—')}</td><td>${esc(s.cls||'—')}</td>
     <td>${submissionModeLabel(s)}</td>
@@ -1899,7 +1900,7 @@ async function renderTeacherAsync(forceRefresh=false){
     el.innerHTML = `
       <p class="hint" style="margin-bottom:10px">📄 ${cappedNote}搜尋只會在這裡顯示的資料中查找。找不到的話，用下方「查詢單一學生完整紀錄」直接查特定人，不受這個上限影響。</p>
       <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="在上面資料中搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
-      <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
+      <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題且達 ${MIN_LEADERBOARD_SCORE} 分；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
       <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV（含超出上限的舊資料）</button>
@@ -2497,7 +2498,7 @@ async function rebuildSnapshots(){
     const all = withKeys.map(x=>x.record);
     toast(`已讀取 ${all.length} 筆歷史紀錄，開始重建…`);
 
-    const lbList = dedupeGroupSubmissions(all.filter(s=> s.correct<=s.total && s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS));
+    const lbList = dedupeGroupSubmissions(all.filter(s=> s.correct<=s.total && s.examType!=='mock' && s.total>=MIN_LEADERBOARD_QUESTIONS && s.score>=MIN_LEADERBOARD_SCORE));
     lbList.sort((a,b)=>compareSubmissions(a,b,'combined'));
     await sSet('snapshot:leaderboard', JSON.stringify(lbList.slice(0,LEADERBOARD_SNAPSHOT_CAP)), true);
 
@@ -2793,7 +2794,7 @@ async function recordIntoFastPaths(record, subKey){
         return JSON.stringify(list);
       });
     }
-  } else if(isSane && record.total >= MIN_LEADERBOARD_QUESTIONS){
+  } else if(isSane && record.total >= MIN_LEADERBOARD_QUESTIONS && record.score >= MIN_LEADERBOARD_SCORE){
     await sTransactionUpdate('snapshot:leaderboard', (currentJson)=>{
       let list = [];
       if(currentJson){ try{ list = JSON.parse(currentJson)||[]; }catch(e){} }
