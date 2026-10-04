@@ -811,6 +811,18 @@ function toast(msg){
   clearTimeout(toastTimer);
   toastTimer = setTimeout(()=>el.classList.remove('show'), 2200);
 }
+/* Defense in depth for guest (other-school, view-only) teacher accounts: the UI
+   already hides every settings/destructive control for guests, but this guards the
+   action handlers themselves too, in case a tab ever gets out of sync or a control
+   is somehow still reachable. Returns true (and shows a toast) when the action
+   should be blocked, so callers write `if(blockIfGuest()) return;`. */
+function blockIfGuest(){
+  if(STATE.teacherRole==='guest'){
+    toast('此功能僅限本校管理密碼使用，查詢密碼僅供查詢。');
+    return true;
+  }
+  return false;
+}
 
 /* Custom confirm modal — native window.confirm()/alert() are blocked inside the
    sandboxed iframe artifacts run in, so we implement our own. Returns a Promise<boolean>. */
@@ -858,7 +870,7 @@ const STATE = {
   lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
   lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
   lbCustomLimit:'',
-  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null },
+  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null, guestPins:null },
   loading:false,
   importBusy:false,
   importError:null,
@@ -870,6 +882,9 @@ const STATE = {
   cleanupBusy:false,
   cleanupDupBusy:false,
   cleanupCodesBusy:false,
+  teacherRole:null,      // 'admin' | 'guest' — set on successful login
+  teacherSchool:null,    // guest's assigned school name (admin: null)
+  guestPinsBusy:false,
   reportedQids:new Set() // qids the student has flagged as broken during this page load, so the button doesn't invite repeat-clicking
 };
 
@@ -1816,7 +1831,7 @@ function viewTeacherLogin(){
   <div class="card" style="max-width:420px;margin:0 auto">
     <span class="section-eyebrow">${icon('key',16)} 教師專區</span>
     <h2 class="h-title">請輸入教師密碼</h2>
-    <p class="h-sub">預設密碼為 <b>0000</b>，登入後可於「設定」頁修改。</p>
+    <p class="h-sub">本校老師請輸入管理密碼（預設 <b>0000</b>，登入後可於「設定」頁修改）。外校老師請先寄信向 <b>fwu6206@tmail.ilc.edu.tw</b> 申請貴校專屬查詢密碼，取得後在此輸入即可進入「僅供查詢」的後台畫面。</p>
     <div class="spacer-16"></div>
     <div id="pinError"></div>
     <div class="field"><input type="password" id="pinInput" placeholder="輸入密碼" inputmode="numeric"></div>
@@ -1825,24 +1840,27 @@ function viewTeacherLogin(){
 }
 
 function viewTeacherDashboard(){
+  const isGuest = STATE.teacherRole==='guest';
+  if(isGuest && STATE.teacherTab==='settings') STATE.teacherTab = 'overview'; // guests can never land here
   renderTeacherAsync();
   return `
   <button class="backlink" data-action="go" data-view="home">← 返回首頁</button>
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap">
       <div>
-        <span class="section-eyebrow">${icon('key',16)} 教師後台</span>
-        <h2 class="h-title">學生學習狀況總覽</h2>
+        <span class="section-eyebrow">${icon('key',16)} 教師後台${isGuest?` · 僅供查詢`:''}</span>
+        <h2 class="h-title">${isGuest ? `${esc(STATE.teacherSchool||'外校')}學生學習狀況` : '學生學習狀況總覽'}</h2>
       </div>
       <button class="btn btn-ghost btn-sm" data-action="teacher-refresh">↻ 重新整理資料</button>
     </div>
+    ${isGuest ? `<p class="hint" style="margin-top:8px">🔎 目前以「${esc(STATE.teacherSchool||'外校')}」查詢密碼登入，以下資料僅顯示貴校學生，且僅供查詢，無法變更任何設定。</p>` : ''}
     <div class="tabs" style="margin-top:18px">
       <button class="tab ${STATE.teacherTab==='overview'?'on':''}" data-action="teacher-tab" data-tab="overview">總覽</button>
       <button class="tab ${STATE.teacherTab==='records'?'on':''}" data-action="teacher-tab" data-tab="records">學生紀錄</button>
       <button class="tab ${STATE.teacherTab==='mistakes'?'on':''}" data-action="teacher-tab" data-tab="mistakes">錯題分析</button>
       <button class="tab ${STATE.teacherTab==='reports'?'on':''}" data-action="teacher-tab" data-tab="reports">🚩 題目回報</button>
       <button class="tab ${STATE.teacherTab==='codes'?'on':''}" data-action="teacher-tab" data-tab="codes">考題代碼</button>
-      <button class="tab ${STATE.teacherTab==='settings'?'on':''}" data-action="teacher-tab" data-tab="settings">設定</button>
+      ${isGuest ? '' : `<button class="tab ${STATE.teacherTab==='settings'?'on':''}" data-action="teacher-tab" data-tab="settings">設定</button>`}
     </div>
     <div id="teacherContent"><div class="loading"><span class="spin"></span>載入資料中…</div></div>
   </div>`;
@@ -1865,6 +1883,7 @@ async function renderTeacherAsync(forceRefresh=false){
     STATE.cache.examcodes = null;
     STATE.cache.recentRecords = null;
     STATE.cache.reportFreq = null;
+    STATE.cache.guestPins = null;
   }
   const codes = await fetchAllExamCodes(forceRefresh);
   if(STATE.view!=='teacher-dashboard') return;
@@ -1872,6 +1891,36 @@ async function renderTeacherAsync(forceRefresh=false){
   if(!el) return;
 
   if(STATE.teacherTab==='overview'){
+    if(STATE.teacherRole==='guest'){
+      // Guests don't get the precise all-time aggregate (snapshot:teacherstats isn't
+      // broken down by school) — instead this is computed from the same capped,
+      // most-recent-3000 recentRecords snapshot already used by the 學生紀錄 tab,
+      // filtered to just their school. Cheap (no extra reads) and clearly labeled as
+      // "recent" rather than "all-time", since very old records could have rolled off.
+      const recent = await fetchRecentRecordsSnapshot(forceRefresh);
+      if(STATE.view!=='teacher-dashboard') return;
+      const mine = recent.filter(r => (r.cls||'')===STATE.teacherSchool);
+      const avg = mine.length ? Math.round(mine.reduce((a,r)=>a+r.score,0)/mine.length) : 0;
+      const byLevel = {};
+      mine.forEach(r=>{ (r.levels||[]).forEach(lv=>{ byLevel[lv]=byLevel[lv]||{c:0,t:0}; byLevel[lv].c+=r.correct; byLevel[lv].t+=r.total; }); });
+      const uniqueStudents = new Set(mine.map(r=>studentKey(r.name,r.seat))).size;
+      el.innerHTML = `
+        <p class="hint" style="margin-bottom:12px">📊 以下統計僅來自最近 ${recent.length} 筆紀錄中屬於貴校的資料，若貴校累積紀錄量很大，較舊的資料可能未納入計算。</p>
+        <div class="stat-grid">
+          <div class="stat-tile"><div class="num">${mine.length}</div><div class="lbl">貴校作答人次（近期）</div></div>
+          <div class="stat-tile"><div class="num">${avg}</div><div class="lbl">平均分數</div></div>
+          <div class="stat-tile"><div class="num">${uniqueStudents}</div><div class="lbl">參與學生人數</div></div>
+        </div>
+        <h3 style="font-family:var(--font-display);font-size:1rem;margin-bottom:10px">各級別／影片單元平均正確率（貴校）</h3>
+        <div class="tbl-wrap"><table><thead><tr><th>級別</th><th>作答題數</th><th>正確率</th></tr></thead><tbody>
+        ${LEVELS.map(l=>{
+          const d = byLevel[l.key]||{c:0,t:0};
+          const pct = d.t? Math.round(d.c/d.t*100):0;
+          return `<tr><td>${l.name}</td><td>${d.t}</td><td>${pct}%</td></tr>`;
+        }).join('')}
+        </tbody></table></div>`;
+      return;
+    }
     const stats = await fetchTeacherStats(forceRefresh);
     if(STATE.view!=='teacher-dashboard') return;
     const avg = stats.totalSubmissions ? Math.round(stats.totalScoreSum/stats.totalSubmissions) : 0;
@@ -1892,22 +1941,26 @@ async function renderTeacherAsync(forceRefresh=false){
       </tbody></table></div>`;
   }
   else if(STATE.teacherTab==='records'){
-    const [recent, stats] = await Promise.all([fetchRecentRecordsSnapshot(forceRefresh), fetchTeacherStats(forceRefresh)]);
+    const isGuest = STATE.teacherRole==='guest';
+    const [recentAll, stats] = await Promise.all([fetchRecentRecordsSnapshot(forceRefresh), fetchTeacherStats(forceRefresh)]);
     if(STATE.view!=='teacher-dashboard') return;
-    const cappedNote = (stats.totalSubmissions||0) > recent.length
-      ? `這裡顯示最新 <b>${recent.length}</b> 筆（全部共 <b>${stats.totalSubmissions}</b> 筆）。`
-      : `這裡顯示全部 <b>${recent.length}</b> 筆紀錄。`;
+    const recent = isGuest ? recentAll.filter(r => (r.cls||'')===STATE.teacherSchool) : recentAll;
+    const cappedNote = isGuest
+      ? `這裡顯示最近資料中屬於貴校的 <b>${recent.length}</b> 筆（若貴校紀錄量很大，較舊的可能未納入）。`
+      : ((stats.totalSubmissions||0) > recent.length
+        ? `這裡顯示最新 <b>${recent.length}</b> 筆（全部共 <b>${stats.totalSubmissions}</b> 筆）。`
+        : `這裡顯示全部 <b>${recent.length}</b> 筆紀錄。`);
     el.innerHTML = `
-      <p class="hint" style="margin-bottom:10px">📄 ${cappedNote}搜尋只會在這裡顯示的資料中查找。找不到的話，用下方「查詢單一學生完整紀錄」直接查特定人，不受這個上限影響。</p>
+      <p class="hint" style="margin-bottom:10px">📄 ${cappedNote}搜尋只會在這裡顯示的資料中查找。找不到的話，用下方「查詢單一學生完整紀錄」直接查特定人${isGuest?'（僅限貴校學生）':'，不受這個上限影響'}。</p>
       <div class="field" style="max-width:300px"><input type="text" id="teacherSearch" placeholder="在上面資料中搜尋姓名／班級座號／代碼" value="${esc(STATE.lbSearch)}"></div>
       <p class="hint" style="margin:6px 0 12px">🛡️ 淺色列代表未達入榜門檻（一般挑戰需滿 ${MIN_LEADERBOARD_QUESTIONS} 題且達 ${MIN_LEADERBOARD_SCORE} 分；模擬考需 ${MOCK_EXAM_MIN_SCORE} 分以上），不會出現在對應的排行榜上。</p>
       <div id="teacherRecordsTbl"></div>
       <div class="spacer-16"></div>
-      <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製全部紀錄為 CSV（含超出上限的舊資料）</button>
+      <button class="btn btn-ghost btn-sm" data-action="copy-records-csv">複製${isGuest?'貴校':'全部'}紀錄為 CSV${isGuest?'':'（含超出上限的舊資料）'}</button>
       <div class="spacer-24"></div>
       <div class="card" style="background:var(--cream-100)">
         <b>🔍 查詢單一學生完整紀錄</b>
-        <p class="hint" style="margin:6px 0 12px">直接輸入姓名和班級座號（需完全一致），查出這位學生的所有歷史紀錄，不受上面的顯示上限影響。</p>
+        <p class="hint" style="margin:6px 0 12px">直接輸入姓名和班級座號（需完全一致），查出這位學生的所有歷史紀錄，不受上面的顯示上限影響${isGuest?'（僅限貴校學生）':''}。</p>
         <div class="field-row">
           <div class="field"><input type="text" id="teacherLookupName" placeholder="姓名，例如：王小明"></div>
           <div class="field"><input type="text" id="teacherLookupSeat" placeholder="班級座號，例如：503 02"></div>
@@ -1962,7 +2015,7 @@ async function renderTeacherAsync(forceRefresh=false){
       ${top.map(([qi,n])=>{
         const q = QDATA[qi]; const lv = q ? levelInfo(q[0]) : null;
         return `<tr><td>${qi}</td><td style="white-space:normal;min-width:260px">${q?esc(q[1]):'（題目索引超出範圍，可能題庫已更新）'}</td><td>${lv?lv.name:'—'}</td><td><b>${n}</b></td>
-        <td><button class="btn btn-ghost btn-sm" data-action="resolve-report" data-qi="${qi}">標記已處理</button></td></tr>`;
+        <td>${STATE.teacherRole==='guest'?'':`<button class="btn btn-ghost btn-sm" data-action="resolve-report" data-qi="${qi}">標記已處理</button>`}</td></tr>`;
       }).join('')}
       </tbody></table></div>`}`;
   }
@@ -1979,17 +2032,35 @@ async function renderTeacherAsync(forceRefresh=false){
         const tooFewQuestions = (c.qids||[]).length < GROUP_CODE_MIN_QUESTIONS;
         const atRisk = tooFewQuestions || (pastGrace && n < GROUP_CODE_MIN_PARTICIPANTS);
         return `<tr${atRisk?' style="opacity:0.6"':''}><td><b>${esc(c.code)}</b>${atRisk?' ⚠️':''}</td><td>${c.levels.map(k=>levelInfo(k).name).join('、')}</td><td>${c.qids.length}${tooFewQuestions?' ⚠️':''}</td><td>${esc(c.creator||'—')}</td><td>${fmtTime(c.createdAt)}</td><td>${n}</td>
-        <td><button class="btn btn-ghost btn-sm" data-action="delete-examcode" data-code="${esc(c.code)}">刪除</button></td></tr>`;
+        <td>${STATE.teacherRole==='guest'?'':`<button class="btn btn-ghost btn-sm" data-action="delete-examcode" data-code="${esc(c.code)}">刪除</button>`}</td></tr>`;
       }).join('')}
       </tbody></table></div>`;
   }
   else if(STATE.teacherTab==='settings'){
+    const guestPins = await fetchGuestPins(forceRefresh);
+    if(STATE.view!=='teacher-dashboard') return;
     el.innerHTML = `
       <div class="field" style="max-width:320px">
         <label>修改教師密碼</label>
         <input type="password" id="newPinInput" placeholder="輸入新密碼">
       </div>
       <button class="btn btn-secondary btn-sm" data-action="save-teacher-pin">儲存新密碼</button>
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--cream-100)">
+        <b>🔑 外校教師查詢密碼</b>
+        <p class="hint" style="margin:6px 0 12px">外校老師寄信申請後，在這裡輸入他們的學校名稱、產生一組專屬密碼，再把密碼回覆給對方即可。這組密碼只能登入「僅供查詢」的後台畫面（看自己學校的學生資料、全站共用的錯題分析與題目回報），完全無法進入「設定」或刪除任何資料，不用擔心誤刪。</p>
+        <div class="field-row">
+          <div class="field"><input type="text" id="newGuestSchoolInput" placeholder="學校名稱，例如：OO國小"></div>
+        </div>
+        <button class="btn btn-secondary btn-sm" data-action="add-guest-school" ${STATE.guestPinsBusy?'disabled':''}>${STATE.guestPinsBusy?'處理中…':'產生查詢密碼'}</button>
+        <div class="spacer-16"></div>
+        ${guestPins.length===0 ? `<p class="muted">目前沒有已核發的查詢密碼。</p>` : `
+        <div class="tbl-wrap"><table><thead><tr><th>學校</th><th>密碼</th><th>核發時間</th><th></th></tr></thead><tbody>
+        ${guestPins.slice().sort((a,b)=>b.createdAt-a.createdAt).map(g=>`
+          <tr><td><b>${esc(g.school)}</b></td><td style="font-family:monospace">${esc(g.pin)}</td><td>${fmtTime(g.createdAt)}</td>
+          <td><button class="btn btn-ghost btn-sm" data-action="revoke-guest-school" data-school="${esc(g.school)}">撤銷</button></td></tr>`).join('')}
+        </tbody></table></div>`}
+      </div>
       <div class="spacer-24"></div>
       <div class="card" style="background:var(--sky-100); border-color:#bfe0e6">
         <b>題庫管理</b>
@@ -2049,10 +2120,12 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     document.getElementById('qdataFileInput').click();
   }
   else if(action==='reimport-qdata'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('重新匯入將會覆蓋目前的題庫，所有人下次開啟時都會看到新題庫，確定要繼續嗎？');
     if(ok){ STATE.importError = null; go('import-data'); }
   }
   else if(action==='restore-default-qdata'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('這會刪除目前已匯入的自訂題庫，讓所有人改回看到網頁內建的預設題庫，確定要繼續嗎？');
     if(ok){
       await restoreDefaultQDATA();
@@ -2143,6 +2216,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     STATE.cache.teacherStats = null;
     STATE.cache.recentRecords = null;
     STATE.cache.reportFreq = null;
+    STATE.cache.guestPins = null;
     STATE.teacherLookupResult = null;
     STATE.teacherLookupError = null;
     render();
@@ -2157,23 +2231,30 @@ document.getElementById('app').addEventListener('click', async (e)=>{
       return;
     }
     STATE.teacherLookupError = null;
-    const results = await fetchMyOwnSubmissions(name, seat);
+    let results = await fetchMyOwnSubmissions(name, seat);
+    if(STATE.teacherRole==='guest'){
+      results = results.filter(r => (r.cls||'')===STATE.teacherSchool);
+    }
     STATE.teacherLookupResult = results;
     render();
   }
   else if(action==='rebuild-snapshots'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('這會重新掃描全部歷史紀錄來重建排行榜快照，資料量大時可能需要一些時間、並消耗較多讀取額度。確定要繼續嗎？');
     if(ok){ await rebuildSnapshots(); }
   }
   else if(action==='cleanup-invalid-scores'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('這會永久刪除所有「正確題數超過總題數」的異常作答紀錄，此動作無法復原。確定要繼續嗎？');
     if(ok){ await cleanupInvalidScores(); }
   }
   else if(action==='cleanup-duplicate-sessions'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('這會找出同一位學生、同樣設定、時間相近的重複紀錄，只保留正確題數最高的一筆，其餘永久刪除，此動作無法復原。確定要繼續嗎？');
     if(ok){ await cleanupDuplicateSessions(); }
   }
   else if(action==='cleanup-underused-codes'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm(`這會刪除題數不足 ${GROUP_CODE_MIN_QUESTIONS} 題、或建立超過一天仍未滿 ${GROUP_CODE_MIN_PARTICIPANTS} 位學生使用的考題代碼，以及其下所有相關成績，此動作無法復原。確定要繼續嗎？`);
     if(ok){ await cleanupUnderusedExamCodes(); }
   }
@@ -2191,6 +2272,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     startMockExamSession();
   }
   else if(action==='delete-examcode'){
+    if(blockIfGuest()) return;
     const ok = await showConfirm('確定要刪除這組考題代碼嗎？（已提交的成績不會被刪除）');
     if(ok){
       await sDel('examcode:'+el.dataset.code, true);
@@ -2199,6 +2281,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     }
   }
   else if(action==='resolve-report'){
+    if(blockIfGuest()) return;
     const qi = el.dataset.qi;
     await sTransactionUpdate('snapshot:reportfreq', (currentJson)=>{
       let freq = {};
@@ -2211,6 +2294,7 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     renderTeacherAsync();
   }
   else if(action==='clear-all-submissions'){
+    if(blockIfGuest()) return;
     const ok1 = await showConfirm('這將永久刪除所有學生作答紀錄（含排行榜快照與個人紀錄），確定要繼續嗎？', true);
     if(!ok1) return;
     const ok2 = await showConfirm('請再次確認：真的要清除所有紀錄嗎？此動作無法復原。', true);
@@ -2242,8 +2326,46 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     renderTeacherAsync();
   }
   else if(action==='save-teacher-pin'){
+    if(blockIfGuest()) return;
     const v = document.getElementById('newPinInput').value.trim();
     if(v){ await sSet('teacher_pin', v, true); toast('密碼已更新'); }
+  }
+  else if(action==='add-guest-school'){
+    if(blockIfGuest()) return;
+    const school = (document.getElementById('newGuestSchoolInput').value||'').trim();
+    if(!school){ toast('請輸入學校名稱'); return; }
+    STATE.guestPinsBusy = true;
+    render();
+    try{
+      const current = await fetchGuestPins(true); // fresh read before modifying, to avoid clobbering a concurrent edit
+      const adminPin = (await sGet('teacher_pin', true)) || '0000';
+      let pin;
+      do { pin = generateGuestPin(); }
+      while(pin===adminPin || current.some(g=>g.pin===pin)); // vanishingly unlikely, but guard anyway
+      const next = current.filter(g=>g.school!==school); // replacing an existing school's pin is just "generate a new one"
+      next.push({ school, pin, createdAt: Date.now() });
+      await sSet('teacher_guest_pins', JSON.stringify(next), true);
+      STATE.cache.guestPins = next;
+      toast(`已產生「${school}」的查詢密碼：${pin}，請回信告知對方。`);
+    }catch(e){
+      console.error('add-guest-school failed', e);
+      toast('產生密碼失敗，請稍後再試一次。');
+    }finally{
+      STATE.guestPinsBusy = false;
+      render();
+    }
+  }
+  else if(action==='revoke-guest-school'){
+    if(blockIfGuest()) return;
+    const school = el.dataset.school;
+    const ok = await showConfirm(`確定要撤銷「${school}」的查詢密碼嗎？撤銷後對方需要重新申請。`);
+    if(!ok) return;
+    const current = await fetchGuestPins(true);
+    const next = current.filter(g=>g.school!==school);
+    await sSet('teacher_guest_pins', JSON.stringify(next), true);
+    STATE.cache.guestPins = next;
+    toast(`已撤銷「${school}」的查詢密碼`);
+    render();
   }
   else if(action==='copy-records-csv'){
     await copyRecordsCsv();
@@ -2890,18 +3012,54 @@ function beginGroupSession(){
 async function teacherLoginSubmit(){
   const v = document.getElementById('pinInput').value;
   const stored = await sGet('teacher_pin', true);
-  const pin = stored || '0000';
-  if(v===pin){
+  const adminPin = stored || '0000';
+  if(v===adminPin){
     STATE.teacherAuthed = true;
+    STATE.teacherRole = 'admin';
+    STATE.teacherSchool = null;
+    STATE.teacherTab = 'overview';
     go('teacher-dashboard');
-  } else {
-    document.getElementById('pinError').innerHTML = `<div class="errmsg">密碼錯誤，請再試一次。</div>`;
+    return;
   }
+  const guestPins = await fetchGuestPins();
+  const match = guestPins.find(g => g.pin === v);
+  if(match){
+    STATE.teacherAuthed = true;
+    STATE.teacherRole = 'guest';
+    STATE.teacherSchool = match.school;
+    STATE.teacherTab = 'overview'; // guests never land on settings, even if it was the last tab viewed
+    go('teacher-dashboard');
+    return;
+  }
+  document.getElementById('pinError').innerHTML = `<div class="errmsg">密碼錯誤，請再試一次。</div>`;
+}
+/* Guest (other-school) view-only passwords. Stored the same lightweight way as
+   teacher_pin — this app's whole security model is "stop accidental damage via the
+   normal UI", not cryptographic access control, so a plain shared JSON list fits the
+   rest of the app's design rather than needing per-account auth infrastructure. */
+async function fetchGuestPins(force=false){
+  if(STATE.cache.guestPins && !force) return STATE.cache.guestPins;
+  const list = await getJSON('teacher_guest_pins', true, []);
+  STATE.cache.guestPins = Array.isArray(list) ? list : [];
+  return STATE.cache.guestPins;
+}
+function generateGuestPin(){
+  // 6-digit random PIN, same numeric-input style as the admin PIN, easy to read aloud/email.
+  return String(Math.floor(100000 + Math.random()*900000));
 }
 
 async function copyRecordsCsv(){
-  toast('正在讀取全部歷史紀錄，資料量大時可能需要幾秒鐘…');
-  const subs = await fetchAllSubmissionsFull();
+  let subs;
+  if(STATE.teacherRole==='guest'){
+    // Guests never trigger the expensive, all-schools full scan — their export is
+    // scoped to their own school from the same cheap, capped snapshot the records
+    // tab already uses, so this never grows into a privacy or cost concern.
+    const recent = await fetchRecentRecordsSnapshot();
+    subs = recent.filter(r => (r.cls||'')===STATE.teacherSchool);
+  } else {
+    toast('正在讀取全部歷史紀錄，資料量大時可能需要幾秒鐘…');
+    subs = await fetchAllSubmissionsFull();
+  }
   const header = ['時間','姓名','學校','班級座號','模式','考題代碼','級別','分數','正確題數','總題數','用時(秒)'];
   const lines = [header.join(',')];
   subs.slice().sort((a,b)=>b.timestamp-a.timestamp).forEach(s=>{
