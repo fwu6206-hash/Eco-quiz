@@ -484,6 +484,69 @@ async function tryLoadQDATAFromStorage(){
     return true;
   }catch(e){ return false; }
 }
+/* Per-question fixes, layered on top of whatever QDATA currently is (the baked-in
+   default or a full teacher-imported bank) — lets a teacher correct one reported
+   question directly in the app without re-exporting and re-uploading the entire
+   question bank just for a single fix. Stored as one small JSON object keyed by
+   array index: {"<qi>": {level,q,opts,ans,exp,patchedAt,originalSnippet}}. The
+   originalSnippet (first ~20 chars of the question text at patch time) guards
+   against a patch silently landing on the wrong row if the base question bank is
+   ever replaced later and indices shift — a mismatch means "don't apply, this isn't
+   the same question anymore" rather than corrupting whatever is now at that index. */
+const QDATA_PATCHES_KEY = 'qdata_patches';
+async function fetchQDataPatches(force=false){
+  if(STATE.cache.qdataPatches && !force) return STATE.cache.qdataPatches;
+  const patches = await getJSON(QDATA_PATCHES_KEY, true, {});
+  STATE.cache.qdataPatches = (patches && typeof patches==='object') ? patches : {};
+  return STATE.cache.qdataPatches;
+}
+function patchSnippet(q){ return (q||'').slice(0, 20); }
+async function applyQDataPatches(){
+  let patches;
+  try{ patches = await fetchQDataPatches(true); }catch(e){ console.error('loading qdata patches failed', e); return; }
+  let appliedCount = 0, skippedCount = 0;
+  for(const key of Object.keys(patches)){
+    const qi = Number(key);
+    const p = patches[key];
+    if(!Number.isInteger(qi) || qi<0 || qi>=QDATA.length || !p) continue;
+    const current = QDATA[qi];
+    // Only apply if the row at this index still looks like the one the patch was
+    // made for (or there's no row there to compare, e.g. right after a fresh patch).
+    if(current && p.originalSnippet && patchSnippet(current[1]) !== p.originalSnippet){
+      skippedCount++;
+      continue;
+    }
+    QDATA[qi] = [p.level, p.q, p.opt0, p.opt1, p.opt2, p.opt3, p.ans, p.exp];
+    appliedCount++;
+  }
+  STATE.qdataPatchSkipped = skippedCount;
+  return { appliedCount, skippedCount };
+}
+/* Saves a teacher's correction for one reported question: writes the patch, applies
+   it to the live in-memory QDATA immediately, and clears that question's report
+   count since it's now fixed. */
+async function saveQuestionPatch(qi, row){
+  const current = QDATA[qi];
+  const patches = await fetchQDataPatches(true);
+  patches[qi] = {
+    level: row[0], q: row[1], opt0: row[2], opt1: row[3], opt2: row[4], opt3: row[5], ans: row[6], exp: row[7],
+    patchedAt: Date.now(),
+    originalSnippet: current ? patchSnippet(current[1]) : ''
+  };
+  const ok = await sSet(QDATA_PATCHES_KEY, JSON.stringify(patches), true);
+  if(!ok) throw new Error('修正內容寫入 Firestore 失敗，請檢查網路連線後再試一次。');
+  STATE.cache.qdataPatches = patches;
+  QDATA[qi] = row;
+  // Auto-resolve the report for this question now that it's fixed.
+  await sTransactionUpdate('snapshot:reportfreq', (currentJson)=>{
+    let freq = {};
+    if(currentJson){ try{ freq = JSON.parse(currentJson)||{}; }catch(e){} }
+    delete freq[qi];
+    return JSON.stringify(freq);
+  });
+  STATE.cache.reportFreq = null;
+}
+
 /* Deletes any imported override in Firestore (both the current sharded format and any
    leftover old-style single document) and falls back to the corrected, baked-in default
    — for recovering from a stale/bad override uploaded at some point in the past (e.g.
@@ -870,7 +933,9 @@ const STATE = {
   lbSortBy:'combined',    // 'combined' | 'score' | 'poolSize' | 'questionCount' | 'duration'
   lbLimit:50,             // 50 | 100 | 200 | 'all' | 'custom'
   lbCustomLimit:'',
-  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null, guestPins:null },
+  cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null, guestPins:null, qdataPatches:null },
+  qdataPatchSkipped:0,
+  editingReportQi:null,
   loading:false,
   importBusy:false,
   importError:null,
@@ -2008,16 +2073,48 @@ async function renderTeacherAsync(forceRefresh=false){
     const freq = await fetchReportFreq(forceRefresh);
     if(STATE.view!=='teacher-dashboard') return;
     const top = Object.entries(freq).filter(([,n])=>n>0).sort((a,b)=>b[1]-a[1]);
+    const isGuestReports = STATE.teacherRole==='guest';
+    const editingQi = STATE.editingReportQi;
+    const editingRow = (editingQi!=null && QDATA[editingQi]) ? QDATA[editingQi] : null;
     el.innerHTML = `
-      <p class="h-sub" style="margin-bottom:14px">學生回報「顯示異常、看不懂在問什麼」的題目，通常是原始題庫裡有亂碼或特殊符號（例如變成一堆「？」），建議依回報次數優先處理，修好後點「標記已處理」讓它從清單移除。</p>
+      <p class="h-sub" style="margin-bottom:14px">學生回報「顯示異常、看不懂在問什麼」的題目，通常是原始題庫裡有亂碼或特殊符號（例如變成一堆「？」），也可能是部分裝置字型顯示問題。確認內容有誤的話，可以直接點「✏️ 修正題目」在這裡改好，不用重新匯出匯入整份題庫；改好的內容會立刻套用、並自動從這份清單移除。</p>
+      ${STATE.qdataPatchSkipped>0 ? `<p class="hint" style="margin-bottom:12px">⚠️ 有 ${STATE.qdataPatchSkipped} 筆先前的修正，因題庫內容已不同（可能重新匯入過整份題庫）而沒有套用，需要重新確認。</p>` : ''}
       ${top.length===0 ? `<div class="empty-state">${ICONS.leaf}<p>目前沒有學生回報顯示異常的題目。</p></div>` : `
       <div class="tbl-wrap"><table><thead><tr><th>#</th><th>題目內容</th><th>級別</th><th>回報次數</th><th></th></tr></thead><tbody>
       ${top.map(([qi,n])=>{
         const q = QDATA[qi]; const lv = q ? levelInfo(q[0]) : null;
         return `<tr><td>${qi}</td><td style="white-space:normal;min-width:260px">${q?esc(q[1]):'（題目索引超出範圍，可能題庫已更新）'}</td><td>${lv?lv.name:'—'}</td><td><b>${n}</b></td>
-        <td>${STATE.teacherRole==='guest'?'':`<button class="btn btn-ghost btn-sm" data-action="resolve-report" data-qi="${qi}">標記已處理</button>`}</td></tr>`;
+        <td>${isGuestReports?'':`<button class="btn btn-ghost btn-sm" data-action="resolve-report" data-qi="${qi}">標記已處理</button>${q?` <button class="btn btn-secondary btn-sm" data-action="edit-report-question" data-qi="${qi}">✏️ 修正題目</button>`:''}`}</td></tr>`;
       }).join('')}
-      </tbody></table></div>`}`;
+      </tbody></table></div>`}
+      ${(!isGuestReports && editingRow) ? `
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--cream-100)" id="editReportCard">
+        <b>✏️ 修正第 ${editingQi} 題</b>
+        <div class="spacer-16"></div>
+        <div class="field">
+          <label>級別</label>
+          <select id="editQLevel">${LEVELS.map(l=>`<option value="${l.key}" ${l.key===editingRow[0]?'selected':''}>${l.name}</option>`).join('')}</select>
+        </div>
+        <div class="field"><label>題目內容</label><textarea id="editQText" rows="3">${esc(editingRow[1])}</textarea></div>
+        <div class="field"><label>選項 A</label><input type="text" id="editQOpt0" value="${esc(editingRow[2])}"></div>
+        <div class="field"><label>選項 B</label><input type="text" id="editQOpt1" value="${esc(editingRow[3])}"></div>
+        <div class="field"><label>選項 C</label><input type="text" id="editQOpt2" value="${esc(editingRow[4])}"></div>
+        <div class="field"><label>選項 D</label><input type="text" id="editQOpt3" value="${esc(editingRow[5])}"></div>
+        <div class="field">
+          <label>正確答案</label>
+          <select id="editQAns">
+            ${['A','B','C','D'].map((l,i)=>`<option value="${i+1}" ${i+1===editingRow[6]?'selected':''}>${l}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>解釋說明（選填）</label><textarea id="editQExp" rows="2">${esc(editingRow[7]||'')}</textarea></div>
+        <div class="spacer-16"></div>
+        <div class="btnrow">
+          <button class="btn btn-primary btn-sm" data-action="save-question-patch" data-qi="${editingQi}">儲存修正</button>
+          <button class="btn btn-ghost btn-sm" data-action="cancel-edit-report">取消</button>
+        </div>
+      </div>` : ''}
+    `;
   }
   else if(STATE.teacherTab==='codes'){
     const stats = await fetchTeacherStats(forceRefresh);
@@ -2292,6 +2389,40 @@ document.getElementById('app').addEventListener('click', async (e)=>{
     STATE.cache.reportFreq = null;
     toast('已標記為處理完成');
     renderTeacherAsync();
+  }
+  else if(action==='edit-report-question'){
+    if(blockIfGuest()) return;
+    STATE.editingReportQi = Number(el.dataset.qi);
+    renderTeacherAsync();
+  }
+  else if(action==='cancel-edit-report'){
+    STATE.editingReportQi = null;
+    renderTeacherAsync();
+  }
+  else if(action==='save-question-patch'){
+    if(blockIfGuest()) return;
+    const qi = Number(el.dataset.qi);
+    const level = Number(document.getElementById('editQLevel').value);
+    const q = document.getElementById('editQText').value.trim();
+    const opt0 = document.getElementById('editQOpt0').value.trim();
+    const opt1 = document.getElementById('editQOpt1').value.trim();
+    const opt2 = document.getElementById('editQOpt2').value.trim();
+    const opt3 = document.getElementById('editQOpt3').value.trim();
+    const ans = Number(document.getElementById('editQAns').value);
+    const exp = document.getElementById('editQExp').value.trim();
+    if(!q || !opt0 || !opt1 || !opt2 || !opt3){
+      toast('題目與四個選項都不能空白');
+      return;
+    }
+    try{
+      await saveQuestionPatch(qi, [level, q, opt0, opt1, opt2, opt3, ans, exp]);
+      STATE.editingReportQi = null;
+      toast('已儲存修正，立即生效');
+      renderTeacherAsync();
+    }catch(e){
+      console.error('save-question-patch failed', e);
+      toast(e.message || '儲存失敗，請稍後再試一次。');
+    }
   }
   else if(action==='clear-all-submissions'){
     if(blockIfGuest()) return;
@@ -3082,6 +3213,8 @@ async function copyRecordsCsv(){
     // Firestore may hold a newer bank if a teacher has re-imported one; if not,
     // QDATA already has the baked-in default and this simply leaves it as-is.
     await tryLoadQDATAFromStorage();
+    // Per-question fixes layer on top of whichever base bank just loaded.
+    await applyQDataPatches();
   }catch(e){
     console.error('QDATA load failed', e);
   }
