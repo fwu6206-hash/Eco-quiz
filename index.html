@@ -951,6 +951,7 @@ const STATE = {
   cache:{ examcodes:null, lbSnapshot:null, mockLbSnapshot:null, teacherStats:null, recentRecords:null, reportFreq:null, guestPins:null, qdataPatches:null },
   qdataPatchSkipped:0,
   editingReportQi:null,
+  viewingMistakeQi:null,
   loading:false,
   importBusy:false,
   importError:null,
@@ -2078,11 +2079,32 @@ async function renderTeacherAsync(forceRefresh=false){
     if(STATE.view!=='teacher-dashboard') return;
     const freq = stats.wrongFreq || {};
     const top = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,30);
+    const viewQi = STATE.viewingMistakeQi;
+    const viewRow = (viewQi!=null && QDATA[viewQi]) ? QDATA[viewQi] : null;
     el.innerHTML = top.length===0 ? `<div class="empty-state">${ICONS.leaf}<p>目前還沒有足夠的錯題資料。</p></div>` : `
-      <p class="h-sub" style="margin-bottom:14px">全班最常答錯的題目，適合安排課堂複習：</p>
-      <div class="tbl-wrap"><table><thead><tr><th>題目</th><th>級別</th><th>答錯人次</th></tr></thead><tbody>
-      ${top.map(([qi,n])=>{ const q=QDATA[qi]; const lv=levelInfo(q[0]); return `<tr><td style="white-space:normal;min-width:260px">${esc(q[1])}</td><td>${lv.name}</td><td><b>${n}</b></td></tr>`; }).join('')}
-      </tbody></table></div>`;
+      <p class="h-sub" style="margin-bottom:14px">全班最常答錯的題目，點「👁️ 複習」可以看到完整題目、選項、正確答案與解析，方便上課講解。這裡只是查看，不會把統計清掉，答錯人次會持續累積。</p>
+      <div class="tbl-wrap"><table><thead><tr><th>題目</th><th>級別</th><th>答錯人次</th><th></th></tr></thead><tbody>
+      ${top.map(([qi,n])=>{ const q=QDATA[qi]; const lv=levelInfo(q[0]); return `<tr><td style="white-space:normal;min-width:260px">${esc(q[1])}</td><td>${lv.name}</td><td><b>${n}</b></td>
+      <td><button class="btn btn-ghost btn-sm" data-action="view-mistake-detail" data-qi="${qi}">👁️ 複習</button></td></tr>`; }).join('')}
+      </tbody></table></div>
+      ${viewRow ? `
+      <div class="spacer-24"></div>
+      <div class="card" style="background:var(--cream-100)" id="mistakeDetailCard">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px">
+          <b>👁️ 第 ${viewQi} 題複習</b>
+          <button class="btn btn-ghost btn-sm" data-action="close-mistake-detail">✕ 關閉</button>
+        </div>
+        <span class="qtag" style="margin-top:10px">${levelInfo(viewRow[0]).name}</span>
+        <div class="qtext">${esc(viewRow[1])}</div>
+        <div class="opt-list">
+        ${[viewRow[2],viewRow[3],viewRow[4],viewRow[5]].map((opt,i)=>{
+          const isCorrect = (i+1)===viewRow[6];
+          return `<div class="opt${isCorrect?' correct':''}" style="pointer-events:none">${['A','B','C','D'][i]}. ${esc(opt)}${isCorrect?' ✓ 正確答案':''}</div>`;
+        }).join('')}
+        </div>
+        ${viewRow[7] ? `<div class="explain ok" style="margin-top:14px"><b>解析：</b>${esc(viewRow[7])}</div>` : ''}
+      </div>` : ''}
+    `;
   }
   else if(STATE.teacherTab==='reports'){
     const freq = await fetchReportFreq(forceRefresh);
@@ -2391,6 +2413,14 @@ document.getElementById('app').addEventListener('click', async (e)=>{
       STATE.cache.examcodes=null;
       renderTeacherAsync();
     }
+  }
+  else if(action==='view-mistake-detail'){
+    STATE.viewingMistakeQi = Number(el.dataset.qi);
+    renderTeacherAsync();
+  }
+  else if(action==='close-mistake-detail'){
+    STATE.viewingMistakeQi = null;
+    renderTeacherAsync();
   }
   else if(action==='resolve-report'){
     if(blockIfGuest()) return;
